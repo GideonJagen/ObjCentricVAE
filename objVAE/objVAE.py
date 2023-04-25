@@ -35,7 +35,7 @@ class objVAE(pl.LightningModule):
         bg, z_bg, kl_bg = self.bg_model(x)
 
         # (B, C, H, W), (B, K, hidden_dim), (B, K, 3), (B, K)
-        fg, indices, kl_divergence, xy, mu, weightmap = self.fg_model(x - bg)
+        fg, indices, kl_divergence, presence, xy, z_fg = self.fg_model(x - bg)
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
         kl_fg = torch.stack(kl_divergence)
 
@@ -47,7 +47,7 @@ class objVAE(pl.LightningModule):
         # reconstruction = bg + fg
         reconstruction = bg + fg
 
-        return reconstruction, weightmap, bg, fg, xy, z_bg, kl_bg, kl_fg
+        return reconstruction, presence, bg, fg, xy, z_fg, kl_bg, kl_fg
 
     def reconstruct(self, x):
         return self(x)[0]
@@ -58,7 +58,7 @@ class objVAE(pl.LightningModule):
         reconstruction, bg, fg, z_what, z_where, z_bg, kl_bg, kl_fg = self(x)
 
         kl_bg = kl_bg.mean()
-        kl_fg = kl_fg.sum(dim=1).mean()
+        kl_fg = kl_fg.mean()
 
         kl = kl_fg + kl_bg
 
@@ -67,15 +67,14 @@ class objVAE(pl.LightningModule):
             rloss = recon_loss
         elif self.lossf == "mae":
             rloss = F.l1_loss(reconstruction, x)
-        weight_MN = x.shape[1] * x.shape[2] * x.shape[3] / 12
 
-        loss = rloss + self.beta * kl * weight_MN
+        loss = rloss + self.beta * kl
 
         self.log_dict(
             {
                 "loss": loss,
                 "reconstruction": recon_loss,
-                "kl": kl,
+                "kl": self.beta * kl,
                 "kl_bg": kl_bg,
                 "kl_fg": kl_fg,
             },

@@ -45,7 +45,7 @@ class objFG(pl.LightningModule):
 
         self.topk_select_method = topk_select_method
 
-        actual_latent_dim = latent_dim * 2
+        actual_latent_dim = latent_dim * 2 + 1
 
         decoder_latent_dim = latent_dim
 
@@ -56,6 +56,7 @@ class objFG(pl.LightningModule):
         elif position_embedding == "sine":
             decoder_latent_dim += self.position_embedding_dim - 2
 
+        self.kl_importance = 0
         # self.encoder = nn.Sequential(
         #     nn.Conv2d(1, 16, 3, 2, 1),
         #     nn.GELU(),
@@ -166,16 +167,19 @@ class objFG(pl.LightningModule):
             nn.Linear(decoder_feature_size, 1),
         )
 
-        self.weight_decoder = nn.Sequential(
-            nn.Linear(decoder_feature_size, 1),
-        )
+        # self.weight_decoder = nn.Sequential(
+        #     nn.Linear(decoder_feature_size, 1),
+        # )
 
     def distribution_map(self, x):
 
         y = self.encoder(x)
 
-        mu = y[:, : self.latent_dim, :, :]
-        logvar = y[:, self.latent_dim :, :, :]
+        z_pres = torch.sigmoid(y[:, 0, :, :] * 2)
+        z_what = y[:, 1:, :, :]
+
+        mu = z_what[:, : self.latent_dim, :, :]
+        logvar = z_what[:, self.latent_dim :, :, :]
 
         return mu, logvar
 
@@ -269,8 +273,11 @@ class objFG(pl.LightningModule):
             align_corners=True,
         )
 
-        mu = y[:, : self.latent_dim, :, :]
-        logvar = y[:, self.latent_dim :, :, :]
+        z_pres = torch.sigmoid(y[:, :1] * 2).view(batch_size, -1)
+        z_what = y[:, 1:]
+
+        mu = z_what[:, : self.latent_dim]
+        logvar = z_what[:, self.latent_dim :]
 
         x_range = torch.arange(0, x.shape[2], device=x.device, dtype=torch.float32)
         y_range = torch.arange(0, x.shape[3], device=x.device, dtype=torch.float32)
@@ -289,14 +296,20 @@ class objFG(pl.LightningModule):
         # to the posterior of the gaussian distribution with mean mu and std std
         # KL divergence is calculated as 0.5 * sum(1 + log(std^2) - mu^2 - std^2)
 
-        kl_divergence = -0.5 * torch.sum(1 + logvar - mu**2 - std**2, dim=1)
+        kl_divergence = -0.5 * torch.mean(1 + logvar - mu**2 - std**2, dim=1)
         kl_divergence = kl_divergence.view(batch_size, -1)
         # find the i,j indices of the max value num_entities elements in the kl_divergence tensor
         # these indices will be used to select the num_entities most important entities
+
+        score = (
+            z_pres**0.01
+            * kl_divergence**self.kl_importance
+            * x_mass.view(batch_size, -1) ** (1 - self.kl_importance)
+        )
         if self.topk_select_method == "random":
-            indices = self.sample_topk(kl_divergence)
+            indices = self.sample_topk(score)
         elif self.topk_select_method == "max":
-            indices = self.select_topk(x_mass.view(batch_size, -1))
+            indices = self.select_topk(score)
         else:
             raise NotImplementedError
         # top_kl_divergence, indices = torch.topk(kl_divergence, self.num_entities, dim=1)
@@ -305,6 +318,9 @@ class objFG(pl.LightningModule):
 
         latents = parametrization[torch.arange(batch_size)[:, None], :, indices]
         pred_delta_xy = delta_xy_pred[torch.arange(batch_size)[:, None], :, indices]
+        presence = z_pres[torch.arange(batch_size)[:, None], indices].view(
+            batch_size, -1, 1, 1, 1
+        )
 
         # repeat latents to match the size of input image
         # (batch_size, num_entities, latent_dim) ->
@@ -327,9 +343,8 @@ class objFG(pl.LightningModule):
         xy_coord = torch.stack([x_coord, y_coord], dim=-1).view(batch_size, -1, 1, 2)
         pred_delta_xy = pred_delta_xy.unsqueeze(2)
 
-        grid_channel = (
-            grid_channel - xy_coord + pred_delta_xy * self.position_prediction_scale
-        ) * self.position_representation_scale
+        xy = xy_coord - pred_delta_xy * self.position_prediction_scale
+        grid_channel = (grid_channel - xy) * self.position_representation_scale
 
         r_channel = torch.norm(grid_channel, p=2, dim=-1)
         mask = r_channel < (self.glimpse_size * self.position_representation_scale)
@@ -352,36 +367,34 @@ class objFG(pl.LightningModule):
         decoded_feature_map = self.decoder_1(intermediate_feature_map)
 
         pixel_map = self.pixel_decoder(decoded_feature_map)
-        weight_map = self.weight_decoder(decoded_feature_map)
 
         # recreate sparse representation
         pixel_map_tensor = torch.zeros(
             batch_size, self.num_entities, x.shape[2] * x.shape[3], device=x.device
         )
-        weight_map_tensor = torch.zeros(
-            batch_size, self.num_entities, x.shape[2] * x.shape[3], device=x.device
-        )
 
         pixel_map_tensor[mask] = pixel_map.view(-1)
-        weight_map_tensor[mask] = weight_map.view(-1)
 
         pixel_map = pixel_map_tensor.view(
             batch_size, self.num_entities, 1, x.shape[2], x.shape[3]
         )
 
-        weight_map = weight_map_tensor.view(
-            batch_size, self.num_entities, 1, x.shape[2], x.shape[3]
+        weight_map = (
+            mask.view(batch_size, self.num_entities, 1, x.shape[2], x.shape[3])
+            * presence
         )
-
-        weight_map = torch.softmax(weight_map, dim=1)
-        weight_map = weight_map * mask.view(
-            batch_size, self.num_entities, 1, x.shape[2], x.shape[3]
-        )
-        weight_map = weight_map / (torch.sum(weight_map, dim=1, keepdim=True) + 1e-8)
 
         y = torch.sum(pixel_map * weight_map, dim=1)
 
-        return [y, indices, kl_divergence, mask, mu, weight_map]
+        xy = xy.view(batch_size, self.num_entities, 2)
+        latents = latents.view(batch_size, self.num_entities, -1)
+        presence = presence.view(batch_size, self.num_entities)
+
+        presence_loss = (z_pres - 1) ** 2 / 32
+
+        kl_divergence = kl_divergence + presence_loss
+
+        return [y, indices, kl_divergence, presence, xy, latents]
 
     def loss_function(self, x, x_hat, kl_divergence, mu, logvar):
         # Reconstruction loss
