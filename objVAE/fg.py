@@ -390,7 +390,7 @@ class objFG(pl.LightningModule):
         latents = latents.view(batch_size, self.num_entities, -1)
         presence = presence.view(batch_size, self.num_entities)
 
-        presence_loss = (z_pres - 1) ** 2 / 32
+        presence_loss = (z_pres - 1) ** 2 / 10
 
         kl_divergence = kl_divergence + presence_loss
 
