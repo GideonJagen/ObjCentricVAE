@@ -167,96 +167,48 @@ class objFG(pl.LightningModule):
             nn.Linear(decoder_feature_size, 1),
         )
 
+        self.presence_bias = 1
         # self.weight_decoder = nn.Sequential(
         #     nn.Linear(decoder_feature_size, 1),
         # )
 
-    def distribution_map(self, x):
-
-        y = self.encoder(x)
-
-        z_pres = torch.sigmoid(y[:, 0, :, :] * 2)
-        z_what = y[:, 1:, :, :]
-
-        mu = z_what[:, : self.latent_dim, :, :]
-        logvar = z_what[:, self.latent_dim :, :, :]
-
-        return mu, logvar
-
-    def parametrize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        parametrization = torch.randn_like(std) * std + mu
-        return parametrization
-
-    def split_latent(self, parametrization):
-        delta_xy = parametrization[:, :2, :, :].view(parametrization.shape[0], 2, -1)
-        parametrization = parametrization[:, 2:, :, :].view(
-            parametrization.shape[0], self.latent_dim - 2, -1
-        )
-        return delta_xy, parametrization
-
-    def select_topk(self, kl_divergence, topk=None):
-
+    def select_topk(self, score, topk=None):
+        """Select latent vectors based on score"""
         if topk is None:
             topk = self.num_entities
-        top_kl_divergence, indices = torch.topk(kl_divergence, topk, dim=1)
+        score, indices = torch.topk(score, topk, dim=1)
         indices = indices.detach()
         return indices
 
-    def sample_topk(self, kl_divergence, topk=None):
+    def sample_topk(self, score, topk=None):
+        """Randomly select latent vectors based on score"""
         if topk is None:
             topk = self.num_entities
 
         # normalize kl_divergence as a probability distribution
-        kl_divergence = F.softmax(kl_divergence, dim=1)
+        score = F.softmax(score, dim=1)
 
         # replace nan with 0
-        kl_divergence = torch.where(
-            torch.isnan(kl_divergence), torch.zeros_like(kl_divergence), kl_divergence
-        )
+        score = torch.where(torch.isnan(score), torch.zeros_like(score), score)
 
         # replace inf with 0
-        kl_divergence = torch.where(
-            torch.isinf(kl_divergence), torch.zeros_like(kl_divergence), kl_divergence
-        )
+        score = torch.where(torch.isinf(score), torch.zeros_like(score), score)
 
         # replace negative values with 0
-        kl_divergence = torch.where(
-            kl_divergence < 0, torch.zeros_like(kl_divergence), kl_divergence
-        )
+        score = torch.where(score < 0, torch.zeros_like(score), score)
 
         # renormalize kl_divergence as a probability distribution
-        kl_divergence = kl_divergence / torch.sum(kl_divergence, dim=1, keepdim=True)
+        score = score / torch.sum(score, dim=1, keepdim=True)
 
         # randomly sample topk indices from kl_divergence
 
         indices = [
-            torch.multinomial(kl_divergence[b], topk, replacement=False)
-            for b in range(kl_divergence.shape[0])
+            torch.multinomial(score[b], topk, replacement=False)
+            for b in range(score.shape[0])
         ]
         indices = torch.stack(indices)
         indices = indices.detach()
         return indices
-
-    def xy_pos_latents(self, indices, in_size, latent_size):
-
-        x_coord = indices // latent_size[3]
-        y_coord = indices % latent_size[3]
-
-        return (
-            (x_coord + 0.5) * in_size[2] / latent_size[2],
-            (y_coord + 0.5) * in_size[3] / latent_size[3],
-        )
-
-    def index_parametrization(self, parametrization, indices):
-        return torch.stack(
-            [
-                torch.stack(
-                    [parametrization[batch_idx, :, idx] for idx in indices[batch_idx]]
-                )
-                for batch_idx in range(parametrization.shape[0])
-            ]
-        )
 
     def forward(self, x):
         batch_size = x.shape[0]
@@ -273,7 +225,7 @@ class objFG(pl.LightningModule):
             align_corners=True,
         )
 
-        z_pres = torch.sigmoid(y[:, :1] * 2).view(batch_size, -1)
+        z_pres = torch.sigmoid(y[:, :1]).view(batch_size, -1)
         z_what = y[:, 1:]
 
         mu = z_what[:, : self.latent_dim]
@@ -301,10 +253,8 @@ class objFG(pl.LightningModule):
         # find the i,j indices of the max value num_entities elements in the kl_divergence tensor
         # these indices will be used to select the num_entities most important entities
 
-        score = (
-            z_pres**0.01
-            * kl_divergence**self.kl_importance
-            * x_mass.view(batch_size, -1) ** (1 - self.kl_importance)
+        score = kl_divergence**self.kl_importance * x_mass.view(batch_size, -1) ** (
+            1 - self.kl_importance
         )
         if self.topk_select_method == "random":
             indices = self.sample_topk(score)
@@ -390,7 +340,7 @@ class objFG(pl.LightningModule):
         latents = latents.view(batch_size, self.num_entities, -1)
         presence = presence.view(batch_size, self.num_entities)
 
-        presence_loss = (z_pres - 1) ** 2 / 10
+        presence_loss = (z_pres - 1) ** 2 * self.presence_bias
 
         kl_divergence = kl_divergence + presence_loss
 

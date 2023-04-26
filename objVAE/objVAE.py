@@ -14,6 +14,7 @@ class objVAE(pl.LightningModule):
         fg_model=None,
         bg_model=None,
         num_entities=16,
+        num_fg_iterations=2,
         beta=0.1,
         learning_rate=1e-4,
         lossf="mse",
@@ -28,6 +29,7 @@ class objVAE(pl.LightningModule):
         self.beta = beta
         self.learning_rate = learning_rate
         self.lossf = lossf
+        self.num_fg_iterations = num_fg_iterations
 
     def forward(self, x):
 
@@ -35,19 +37,31 @@ class objVAE(pl.LightningModule):
         bg, z_bg, kl_bg = self.bg_model(x)
 
         # (B, C, H, W), (B, K, hidden_dim), (B, K, 3), (B, K)
+        # for iteration in range(self.num_fg_iterations):
         fg, indices, kl_divergence, presence, xy, z_fg = self.fg_model(x - bg)
+
+        fgs = [fg]
+
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
+        for iteration in range(self.num_fg_iterations - 1):
+            _fg, _indices, _kl_divergence, _presence, _xy, _z_fg = self.fg_model(
+                x - bg - fg
+            )
+            fg = fg + _fg
+            kl_divergence = kl_divergence + [
+                kld[idx] for kld, idx in zip(_kl_divergence, _indices)
+            ]
+            presence = torch.cat([presence, _presence], dim=1)
+            xy = torch.cat([xy, _xy], dim=1)
+            z_fg = torch.cat([z_fg, _z_fg], dim=1)
+
+            fgs.append(_fg)
+
         kl_fg = torch.stack(kl_divergence)
 
-        # loss_dict = self.model.loss_function(x, fg, kl_divergence, mu, logvar)
-        # self.log_dict(loss_dict, on_epoch=True, prog_bar=True)
-        # return loss_dict["loss"]
-
-        # Treat fg as residual. For microscopy, this is a good assumption.
-        # reconstruction = bg + fg
         reconstruction = bg + fg
 
-        return reconstruction, presence, bg, fg, xy, z_fg, kl_bg, kl_fg
+        return reconstruction, presence, bg, fgs, xy, z_fg, kl_bg, kl_fg
 
     def reconstruct(self, x):
         return self(x)[0]
@@ -55,7 +69,7 @@ class objVAE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x = batch
 
-        reconstruction, bg, fg, z_what, z_where, z_bg, kl_bg, kl_fg = self(x)
+        reconstruction, bg, fgs, z_what, z_where, z_bg, kl_bg, kl_fg = self(x)
 
         kl_bg = kl_bg.mean()
         kl_fg = kl_fg.mean()
