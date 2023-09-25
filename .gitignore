@@ -1,2 +1,5 @@
 checkpoints/
 lightning_logs/
+*.csv
+*.png
+*.pyc

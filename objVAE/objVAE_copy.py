@@ -6,38 +6,36 @@ import torchvision.transforms as transforms
 import pytorch_lightning as pl
 from objVAE.MultiheadAttention import MultiheadAttention
 
-# torch.manual_seed(0)
-# random.seed(0)
-# np.random.seed(0)
-# , number_of_heads=1, softmax_tmp = 1,
-
+#torch.manual_seed(0)
+#random.seed(0)
+#np.random.seed(0)
+#, number_of_heads=1, softmax_tmp = 1,
 
 class MultiEntityVariationalAutoEncoder(pl.LightningModule):
     def __init__(
-        self,
-        num_entities,
-        attention_model=None,
-        beta=0.1,
-        latent_dim=12,
-        attention=True,
-        combine_method="sum",
-        object_radius=12,
-    ):
+            self,
+            num_entities,
+            attention_model = None,
+            beta=0.1,
+            latent_dim=12,
+            attention=True,
+            aggregation = "max",
+        ):
+        
         super(MultiEntityVariationalAutoEncoder, self).__init__()
 
         self.num_entities = num_entities
         self.beta = beta
         self.latent_dim = latent_dim
         self.attention = attention
-        self.combine_method = combine_method
-        self.object_radius = object_radius
+        self.aggregation = aggregation
 
         self.presence_bias = 1
         actual_latent_dim = latent_dim * 2 + 1
 
         self.time_attention = attention_model
         if self.time_attention == None:
-            self.time_attention = MultiheadAttention(num_filters=latent_dim + 1)
+            self.time_attention = MultiheadAttention(num_filters=latent_dim+1)
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 8, 3, padding=1),
@@ -71,11 +69,13 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             nn.Conv2d(32, 1, 1, padding=0),
         )
 
+    
+
     def forward(self, x):
         true_batch_size = x.shape[0]
         timesteps = x.shape[1]
 
-        batch_size = true_batch_size * timesteps
+        batch_size = true_batch_size*timesteps
 
         x = x.view(batch_size, x.shape[2], x.shape[3], x.shape[4])
 
@@ -84,8 +84,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         z_pres = torch.sigmoid(y[:, :1]).view(batch_size, -1)
         z_what = y[:, 1:]
 
-        mu = z_what[:, : self.latent_dim, :, :]
-        logvar = z_what[:, self.latent_dim :, :, :]
+        mu = z_what[:, :self.latent_dim, :, :]
+        logvar = z_what[:, self.latent_dim:, :, :]
 
         x_range = torch.arange(0, x.shape[3], device=x.device, dtype=torch.float32)
         y_range = torch.arange(0, x.shape[2], device=x.device, dtype=torch.float32)
@@ -96,9 +96,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         parametrization = torch.randn_like(std) * std + mu
 
         delta_xy_pred = parametrization[:, :2].view(batch_size, 2, -1)
-        parametrization = parametrization[:, 2:].view(
-            batch_size, self.latent_dim - 2, -1
-        )
+        parametrization = parametrization[:, 2:].view(batch_size, self.latent_dim - 2, -1)
+        
 
         # Calculate the KL divergence from the prior of gaussian distribution with mean 0 and std 1
         # to the posterior of the gaussian distribution with mean mu and std std
@@ -117,8 +116,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             [
                 torch.stack(
                     [parametrization[batch_idx, :, idx] for idx in indices[batch_idx]]
-                )
-                for batch_idx in range(batch_size)
+                ) for batch_idx in range(batch_size)
             ]
         )
 
@@ -130,32 +128,29 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             [
                 torch.stack(
                     [delta_xy_pred[batch_idx, :, idx] for idx in indices[batch_idx]]
-                )
-                for batch_idx in range(batch_size)
+                ) for batch_idx in range(batch_size)
             ]
         )
 
-        x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2] - xy_pred[:, :, 0] * 2
-        y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3] - xy_pred[:, :, 1] * 2
+        x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2] - xy_pred[:, :, 0]*2
+        y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3] - xy_pred[:, :, 1]*2
 
-        # x_coord /= x.shape[2]
-        # y_coord /= x.shape[3]
 
-        xy = torch.stack([x_coord, y_coord], dim=2)
-        # r = torch.norm(xy_coords, p=2, dim=-1, keepdim=True)
+        #x_coord /= x.shape[2]
+        #y_coord /= x.shape[3]
 
-        expanded_latents = torch.cat([latents, xy], dim=2)
-        # expanded_latents = latents
+        xy_coords = torch.stack([x_coord, y_coord], dim=2)
+        #r = torch.norm(xy_coords, p=2, dim=-1, keepdim=True)
 
+
+        expanded_latents = torch.cat([latents, xy_coords], dim=2)
+        #expanded_latents = latents
+        
         times = torch.arange(0, timesteps, device=x.device, dtype=torch.int32)
-        times = torch.unsqueeze(times.repeat(true_batch_size), -1).repeat(
-            1, self.num_entities
-        )
+        times = torch.unsqueeze(times.repeat(true_batch_size), -1).repeat(1, self.num_entities)
 
         times = times.view(true_batch_size, timesteps, expanded_latents.shape[1], -1)
-        new_latents = expanded_latents.view(
-            true_batch_size, timesteps, expanded_latents.shape[1], -1
-        )
+        new_latents = expanded_latents.view(true_batch_size, timesteps, expanded_latents.shape[1], -1)
 
         new_latents, attention = self.time_attention(new_latents, times)
 
@@ -175,10 +170,11 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         x_coord = indices // y.shape[3]
         y_coord = indices % y.shape[3]
 
+        
         # add 0.5 to the coordinates to center the grid channel around the coordinates of the entities
         # scale the coordinates to match the size of the input image
-        x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2]
-        y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3]
+        x_coord = ((x_coord + 0.5) * x.shape[2] / y.shape[2]) 
+        y_coord = ((y_coord + 0.5) * x.shape[3] / y.shape[3])
         xy_coord = torch.stack([x_coord, y_coord], dim=2)[..., None, None]
         grid_channel = grid_channel - xy_coord
 
@@ -187,21 +183,18 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             [
                 torch.stack(
                     [delta_xy_pred[batch_idx, :, idx] for idx in indices[batch_idx]]
-                )
-                for batch_idx in range(batch_size)
+                ) for batch_idx in range(batch_size)
             ]
         )[..., None, None]
         grid_channel = grid_channel + pred_delta_xy * 2
 
         r_channel = torch.sqrt(torch.sum(grid_channel**2, dim=2, keepdim=True))
-        # r_channel = torch.norm(grid_channel, p=2, dim=-1)
-        mask = r_channel < self.object_radius
 
+        
         # concatenate the grid channel and the latents
         # (batch_size, num_entities, latent_dim + 2, x.shape[2], x.shape[3])
-        intermediate_feature_map = torch.cat(
-            [latents, r_channel / 4, grid_channel / 4], dim=2
-        )
+        intermediate_feature_map = torch.cat([latents, r_channel / 4, grid_channel / 4], dim=2)
+
 
         # flatten batch and num_entities dimensions
         # (batch_size * num_entities, latent_dim + 2, x.shape[2], x.shape[3])
@@ -216,34 +209,25 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         decoded_feature_map = decoded_feature_map.view(
             batch_size, self.num_entities, -1, x.shape[2], x.shape[3]
         )
-
-        # Multiply each objects feature map with presence
-        pres = z_pres[torch.arange(batch_size)[:, None], indices].view(
-            batch_size, -1, 1, 1, 1
-        )
-        decoded_feature_map * pres * mask
-
+        
         # reduce entity dimension by taking max
-        if self.combine_method == "max":
-            combined_entities = torch.max(decoded_feature_map, dim=1)[0]
-        elif self.combine_method == "sum":
+        if self.aggregation == "sum":
             combined_entities = torch.sum(decoded_feature_map, dim=1)
+        elif self.aggregation == "max":
+            combined_entities = torch.max(decoded_feature_map, dim=1)[0]
         else:
             raise NotImplementedError
+
 
         y = self.decoder_2(combined_entities)
 
         y = y.view(true_batch_size, timesteps, x.shape[1], x.shape[2], x.shape[3])
 
-        # presence_loss = z_pres**2 * self.presence_bias
-
         presence_loss = (z_pres - 1) ** 2 * self.presence_bias
-
         kl_divergence += presence_loss
 
-        xy = xy_coord - pred_delta_xy
 
-        return [y, indices, z_pres, kl_divergence, delta_xy_pred, mu, logvar, attention]
+        return [y, indices, kl_divergence, delta_xy_pred, mu, logvar, attention]
 
     def loss_function(self, x, x_hat, kl_divergence, mu, logvar):
         # Reconstruction loss
@@ -266,32 +250,16 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
 
 
 class MEVAE(pl.LightningModule):
-    def __init__(
-        self,
-        num_entities,
-        attention_model=None,
-        beta=0.1,
-        latent_dim=12,
-        attention=True,
-        combine_method="sum",
-        object_radius=12,
-    ):
+    def __init__(self, num_entities, attention_model = None, beta=0.1, attention=True):
         super().__init__()
-        self.model = MultiEntityVariationalAutoEncoder(
-            num_entities,
-            attention_model,
-            beta,
-            latent_dim=latent_dim,
-            attention=attention,
-            combine_method=combine_method,
-            object_radius=object_radius,
-        )
+        self.model = MultiEntityVariationalAutoEncoder(num_entities, attention_model, beta, attention=attention)
+
 
     def forward(self, x):
         return self.model(x)
 
     def training_step(self, x, batch_idx):
-        x_hat, indices, z_pres, kl_divergence, xy, mu, logvar, attention = self(x)
+        x_hat, indices, kl_divergence, xy, mu, logvar, attention = self(x)
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
 
         kl_divergence = torch.stack(kl_divergence)
@@ -300,7 +268,7 @@ class MEVAE(pl.LightningModule):
         return loss_dict["loss"]
 
     def validation_step(self, x, batch_idx):
-        x_hat, indices, z_pres, kl_divergence, xy, mu, logvar, attention = self(x)
+        x_hat, indices, kl_divergence, xy, mu, logvar = self(x)
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
 
         kl_divergence = torch.stack(kl_divergence)
