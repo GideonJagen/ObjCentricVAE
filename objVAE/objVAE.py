@@ -159,25 +159,36 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2] - xy_pred[:, :, 0] * 2
         y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3] - xy_pred[:, :, 1] * 2
 
-        xy = torch.stack([x_coord, y_coord], dim=2)
+        xy_out = torch.stack([x_coord, y_coord], dim=2)
 
-        xy_norm = torch.stack(
-            [x_coord / x.shape[2] - 0.5, y_coord / x.shape[3] - 0.5], dim=2
+        x_coord_flipped = (x_coord - 64) * -1
+        y_coord_flipped = (y_coord - 64) * -1
+        xy = torch.stack(
+            [
+                x_coord,
+                y_coord,
+                x_coord_flipped,
+                y_coord,
+                x_coord,
+                y_coord_flipped,
+                x_coord_flipped,
+                y_coord_flipped,
+            ],
+            dim=2,
         )
 
-        # expanded_latents = torch.cat([latents, xy], dim=2)
-        expanded_latents = latents
+        # xy_norm = torch.stack(
+        #    [x_coord / x.shape[2] - 0.5, y_coord / x.shape[3] - 0.5], dim=2
+        # )
 
         times = torch.arange(0, timesteps, device=x.device, dtype=torch.int32)
         times = torch.unsqueeze(times.repeat(true_batch_size), -1).repeat(
             1, self.num_entities
         )
+        times = times.view(true_batch_size, timesteps, latents.shape[1], -1)
 
-        times = times.view(true_batch_size, timesteps, expanded_latents.shape[1], -1)
-        new_latents = expanded_latents.view(
-            true_batch_size, timesteps, expanded_latents.shape[1], -1
-        )
-        positions = xy.view(true_batch_size, timesteps, xy_norm.shape[1], -1)
+        new_latents = latents.view(true_batch_size, timesteps, latents.shape[1], -1)
+        positions = xy.view(true_batch_size, timesteps, xy.shape[1], -1)
 
         new_latents, attention = self.time_attention(new_latents, positions, times)
 
@@ -272,7 +283,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             mu,
             logvar,
             attention,
-            xy,
+            xy_out,
         ]
 
     def loss_function(self, x, x_hat, kl_divergence, mu, logvar):
