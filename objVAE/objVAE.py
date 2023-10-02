@@ -159,14 +159,14 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2] - xy_pred[:, :, 0] * 2
         y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3] - xy_pred[:, :, 1] * 2
 
-        # x_coord /= x.shape[2]
-        # y_coord /= x.shape[3]
-
         xy = torch.stack([x_coord, y_coord], dim=2)
-        # r = torch.norm(xy_coords, p=2, dim=-1, keepdim=True)
 
-        expanded_latents = torch.cat([latents, xy], dim=2)
-        # expanded_latents = latents
+        xy_norm = torch.stack(
+            [x_coord / x.shape[2] - 0.5, y_coord / x.shape[3] - 0.5], dim=2
+        )
+
+        # expanded_latents = torch.cat([latents, xy], dim=2)
+        expanded_latents = latents
 
         times = torch.arange(0, timesteps, device=x.device, dtype=torch.int32)
         times = torch.unsqueeze(times.repeat(true_batch_size), -1).repeat(
@@ -177,11 +177,12 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         new_latents = expanded_latents.view(
             true_batch_size, timesteps, expanded_latents.shape[1], -1
         )
+        positions = xy.view(true_batch_size, timesteps, xy_norm.shape[1], -1)
 
-        new_latents, attention = self.time_attention(new_latents, times, pres)
+        new_latents, attention = self.time_attention(new_latents, positions, times)
 
         if self.attention:
-            latents = new_latents[:, :, :-2]
+            latents = new_latents
 
         # repeat latents to match the size of input image
         # (batch_size, num_entities, latent_dim, 1, 1) -> (batch_size, num_entities, latent_dim, x.shape[2], x.shape[3]
@@ -421,10 +422,10 @@ class OldMultiEntityVariationalAutoEncoder(pl.LightningModule):
         # y_coord /= x.shape[3]
 
         xy_coords = torch.stack([x_coord, y_coord], dim=2)
-        # r = torch.norm(xy_coords, p=2, dim=-1, keepdim=True)
 
-        expanded_latents = torch.cat([latents, xy_coords], dim=2)
-        # expanded_latents = latents
+        # expanded_latents = torch.cat([latents, xy_coords], dim=2)
+
+        expanded_latents = latents
 
         times = torch.arange(0, timesteps, device=x.device, dtype=torch.int32)
         times = torch.unsqueeze(times.repeat(true_batch_size), -1).repeat(
@@ -436,10 +437,9 @@ class OldMultiEntityVariationalAutoEncoder(pl.LightningModule):
             true_batch_size, timesteps, expanded_latents.shape[1], -1
         )
 
-        new_latents, attention = self.time_attention(new_latents, times)
+        positions = xy_coords.view(true_batch_size, timesteps, xy_coords.shape[1], -1)
 
-        if self.attention:
-            latents = new_latents[:, :, :-2]
+        new_latents, attention = self.time_attention(new_latents, positions, times)
 
         # repeat latents to match the size of input image
         # (batch_size, num_entities, latent_dim, 1, 1) -> (batch_size, num_entities, latent_dim, x.shape[2], x.shape[3]
