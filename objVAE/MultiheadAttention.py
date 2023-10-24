@@ -53,14 +53,14 @@ class MultiheadAttention(pl.LightningModule):
         attention = torch.mean(attention, dim=0, keepdim=True)
 
         attention += (1 - mask) * -10e9
-        attention = torch.nn.functional.softmax(attention * self.softmax_factor, dim=-1)
+        attention = torch.nn.functional.softmax(attention, dim=2)
         attention = torch.mean(attention, axis=0, keepdim=True)
 
         add_eye = torch.eye(attention.shape[1], device=attention.device)
         updated_latents = torch.matmul(attention + add_eye, updated_latents) / 2
         updated_latents = updated_latents.view(-1, self.number_of_filters)
 
-        # updated_latents = self.combine_time_dense(updated_latents)
+        updated_latents = self.combine_time_dense(updated_latents)
 
         updated_latents = updated_latents.view(
             batch_size * timesteps, -1, updated_latents.shape[-1]

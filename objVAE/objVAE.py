@@ -25,6 +25,11 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         combine_method="sum",
         topk_select_method="max",
         object_radius=12,
+        decoder="linnear",
+        decoder_feature_size=56,
+        decoder_num_layers=3,
+        encoder_num_layers=3,
+        glimpse_size=32,
     ):
         super(MultiEntityVariationalAutoEncoder, self).__init__()
 
@@ -36,64 +41,62 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         self.object_radius = object_radius
         self.single_decoder = single_decoder
         self.topk_select_method = topk_select_method
+        self.decoder = decoder
+        self.glimpse_size = glimpse_size
 
         self.presence_bias = 1
+        self.kl_importance = 0
+        self.position_representation_scale = 1
+        self.position_prediction_scale = 1
+
         actual_latent_dim = latent_dim * 2 + 1
+        decoder_latent_dim = latent_dim
 
         self.time_attention = attention_model
         if self.time_attention == None:
             self.time_attention = MultiheadAttention(num_filters=latent_dim + 1)
 
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, 8, 3, padding=1),
+            nn.Conv2d(1, 16, 3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
-            nn.Conv2d(8, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
+            *[
+                nn.Sequential(
+                    nn.Conv2d(16, 16, 3, padding=1),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2, 2),
+                )
+                for _ in range(encoder_num_layers - 1)
+            ],
             nn.Conv2d(16, 32, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1),
+            nn.Conv2d(32, 32, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, actual_latent_dim, 3, padding=1),
+            nn.Conv2d(32, actual_latent_dim, 3, padding=1),
         )
 
-        if single_decoder:
-            self.decoder_1 = nn.Sequential(
-                nn.Conv2d(self.latent_dim + 1, 32, 1, padding=0),
+        def decoder_block(in_filters, out_filters):
+            return nn.Sequential(
+                nn.Linear(in_filters, out_filters),
                 nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 1, 1, padding=0),
-            )
-        else:
-            self.decoder_1 = nn.Sequential(
-                nn.Conv2d(self.latent_dim + 1, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
             )
 
-            self.decoder_2 = nn.Sequential(
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, 1, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 1, 1, padding=0),
-            )
+        self.decoder_1 = nn.Sequential(
+            *[
+                decoder_block(
+                    decoder_latent_dim + 1,
+                    decoder_feature_size,
+                ),
+                *[
+                    decoder_block(
+                        decoder_feature_size,
+                        decoder_feature_size,
+                    )
+                    for _ in range(decoder_num_layers - 1)
+                ],
+            ],
+            nn.Linear(decoder_feature_size, 1),
+        )
 
     def forward(self, x):
         true_batch_size = x.shape[0]
@@ -104,14 +107,24 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
 
         y = self.encoder(x)
 
+        x_mass = torch.abs(x)
+
+        # resize x_mass
+        x_mass = F.interpolate(
+            x_mass,
+            size=(y.shape[2], y.shape[3]),
+            mode="bilinear",
+            align_corners=True,
+        )
+
         z_pres = torch.sigmoid(y[:, :1]).view(batch_size, -1)
         z_what = y[:, 1:]
 
         mu = z_what[:, : self.latent_dim, :, :]
         logvar = z_what[:, self.latent_dim :, :, :]
 
-        x_range = torch.arange(0, x.shape[3], device=x.device, dtype=torch.float32)
-        y_range = torch.arange(0, x.shape[2], device=x.device, dtype=torch.float32)
+        x_range = torch.arange(0, x.shape[2], device=x.device, dtype=torch.float32)
+        y_range = torch.arange(0, x.shape[3], device=x.device, dtype=torch.float32)
         x_grid, y_grid = torch.meshgrid(x_range, y_range)
 
         std = torch.exp(0.5 * logvar)
@@ -132,7 +145,9 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         # find the i,j indices of the max value num_entities elements in the kl_divergence tensorimage_size
         # these indices will be used to select the num_entities most important entities
 
-        score = kl_divergence
+        score = kl_divergence**self.kl_importance * x_mass.view(batch_size, -1) ** (
+            1 - self.kl_importance
+        )
         # **self.kl_importance * x_mass.view(batch_size, -1) ** (
         #    1 - self.kl_importance
         # )
@@ -143,7 +158,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         else:
             raise NotImplementedError
 
-        indices = indices.detach()
+        # indices = indices.detach()
         intermediate_feature_map = None
 
         latents = parametrization[torch.arange(batch_size)[:, None], :, indices]
@@ -159,8 +174,12 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
 
         # add 0.5 to the coordinates to center the grid channel around the coordinates of the entities
         # scale the coordinates to match the size of the input image and add predicted offset
-        x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2] - xy_pred[:, :, 0] * 2
-        y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3] - xy_pred[:, :, 1] * 2
+        x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2] - xy_pred[
+            :, :, 0
+        ] * self.position_prediction_scale
+        y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3] - xy_pred[
+            :, :, 1
+        ] * self.position_prediction_scale
 
         # stack x and y aswell as x and y flipped
         positional_embeddings = torch.stack(
@@ -195,43 +214,66 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
 
         # repeat latents to match the size of input image
         # (batch_size, num_entities, latent_dim, 1, 1) -> (batch_size, num_entities, latent_dim, x.shape[2], x.shape[3]
-        latents = latents[:, :, :, None, None].repeat(1, 1, 1, x.shape[3], x.shape[2])
+        latents = latents[:, :, None, :].repeat(1, 1, x.shape[2] * x.shape[3], 1)
 
         # grid channel is a tensor of size (batch_size, latent_dim, 2, x.shape[2], x.shape[3])
         # it contains the x and y coordinates of each pixel in the image
-        grid_channel = torch.stack([x_grid, y_grid])[None, None]
-        grid_channel = grid_channel.repeat(batch_size, self.num_entities, 1, 1, 1)
+        grid_channel = torch.stack([x_grid, y_grid], dim=-1).view(1, 1, -1, 2)
 
-        xy_coord = torch.stack([x_coord, y_coord], dim=2)[..., None, None]
-        grid_channel = grid_channel - xy_coord
+        xy_coord = torch.stack([x_coord, y_coord], dim=-1).view(batch_size, -1, 1, 2)
 
-        r_channel = torch.sqrt(torch.sum(grid_channel**2, dim=2, keepdim=True))
+        grid_channel = (grid_channel - xy_coord) * self.position_representation_scale
+
+        r_channel = torch.norm(grid_channel, p=2, dim=-1)
+        mask = r_channel < (self.glimpse_size * self.position_representation_scale)
+
+        reduced_grid = grid_channel[mask, :]
+        reduced_latents = latents[mask, :]
+
+        # if self.position_embedding == "none":
+        #    ...
+        # elif self.position_embedding == "radial":
+        r_channel = torch.norm(reduced_grid, p=2, dim=-1, keepdim=True)
+        reduced_grid = torch.cat([reduced_grid, r_channel], dim=-1)
+        # elif self.position_embedding == "sine":
+        # reduced_grid = self.sine_embedding(reduced_grid)
 
         # concatenate the grid channel and the latents
         # (batch_size, num_entities, latent_dim + 2, x.shape[2], x.shape[3])
-        intermediate_feature_map = torch.cat(
-            [latents, r_channel / 4, grid_channel / 4], dim=2
-        )
+        intermediate_feature_map = torch.cat([reduced_latents, reduced_grid], dim=-1)
 
         # flatten batch and num_entities dimensions
         # (batch_size * num_entities, latent_dim + 2, x.shape[2], x.shape[3])
-        intermediate_feature_map = intermediate_feature_map.view(
-            batch_size * self.num_entities, -1, x.shape[2], x.shape[3]
+        # intermediate_feature_map = intermediate_feature_map.view(
+        #    batch_size * self.num_entities, -1, x.shape[2], x.shape[3]
+        # )
+
+        pixel_map = self.decoder_1(intermediate_feature_map)
+
+        pixel_map_tensor = torch.zeros(
+            batch_size, self.num_entities, x.shape[2] * x.shape[3], device=x.device
         )
 
-        decoded_feature_map = self.decoder_1(intermediate_feature_map)
+        pixel_map_tensor[mask] = pixel_map.view(-1)
 
+        pixel_map = pixel_map_tensor.view(
+            batch_size, self.num_entities, 1, x.shape[2], x.shape[3]
+        )
+
+        weight_map = (
+            mask.view(batch_size, self.num_entities, 1, x.shape[2], x.shape[3]) * pres
+        )
+
+        """
         # unflatten batch and num_entities dimensions
         # (batch_size, num_entities, 32, x.shape[2], x.shape[3])
         decoded_feature_map = decoded_feature_map.view(
-            batch_size, self.num_entities, -1, x.shape[3], x.shape[2]
+            batch_size, self.num_entities, -1, x.shape[2], x.shape[3]
         )
+        """
 
         # Multiply each objects feature map with presence
-        decoded_feature_map *= pres
-        if self.object_radius:
-            mask = r_channel < self.object_radius
-            decoded_feature_map *= mask
+        decoded_feature_map = pixel_map * weight_map
 
         # reduce entity dimension by taking max
         if self.combine_method == "max":
@@ -247,7 +289,6 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         y = y.view(true_batch_size, timesteps, x.shape[1], x.shape[2], x.shape[3])
 
         presence_loss = (z_pres - 1) ** 2 * self.presence_bias
-        # presence_loss = z_pres**2 * self.presence_bias
 
         kl_divergence += presence_loss
 
@@ -264,22 +305,23 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         ]
 
     def loss_function(self, x, x_hat, kl_divergence, mu, logvar):
-        # Reconstruction loss
-        reconstruction_loss = F.mse_loss(x_hat, x)
-        # KL divergence loss
-        kl_divergence_loss = torch.mean(torch.sum(kl_divergence, dim=1), dim=0)
+        # reconstruction_loss = torch.mean(torch.abs(error))
+        recon_loss = F.mse_loss(x_hat, x)
 
-        # MN weighting
-        weight_MN = x.shape[1] * x.shape[2] * x.shape[3] / 12
+        # KL divergence loss
+        kl_divergence_loss = kl_divergence.mean()
+
+        ## MN weighting
+        # weight_MN = x.shape[1] * x.shape[2] * x.shape[3] / 12
 
         # Total loss
-        loss = reconstruction_loss + kl_divergence_loss * weight_MN * self.beta
+        loss = recon_loss + kl_divergence_loss * self.beta
 
         return {
             "loss": loss,
-            "reconstruction_loss": reconstruction_loss,
+            "reconstruction_loss": recon_loss,
             "KLD": kl_divergence_loss,
-            "weighted_KLD": kl_divergence_loss * weight_MN * self.beta,
+            "weighted_KLD": kl_divergence_loss * self.beta,
         }
 
     def select_topk(self, score, topk=None):
@@ -333,6 +375,11 @@ class MEVAE(pl.LightningModule):
         topk_select_method="max",
         object_radius=12,
         single_decoder=True,
+        decoder="linnear",
+        decoder_feature_size=56,
+        decoder_num_layers=3,
+        encoder_num_layers=3,
+        glimpse_size=32,
     ):
         super().__init__()
 
@@ -348,6 +395,11 @@ class MEVAE(pl.LightningModule):
             topk_select_method=topk_select_method,
             object_radius=object_radius,
             single_decoder=single_decoder,
+            decoder=decoder,
+            decoder_feature_size=decoder_feature_size,
+            decoder_num_layers=decoder_num_layers,
+            encoder_num_layers=encoder_num_layers,
+            glimpse_size=glimpse_size,
         )
 
     def forward(self, x):
