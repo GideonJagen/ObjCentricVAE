@@ -13,7 +13,6 @@ class MultiheadAttention(pl.LightningModule):
         number_of_heads=1,
         num_filters=12,
         attention_mechanism="cosine-similarity",
-        pos_attention_weight=100,  # Weight between position attention and morphology attention
         **kwargs
     ):
         super(MultiheadAttention, self).__init__()
@@ -23,9 +22,8 @@ class MultiheadAttention(pl.LightningModule):
         self.softmax_factor = softmax_factor
         self.number_of_heads = number_of_heads
         self.number_of_filters = num_filters
-        self.pos_attention_weight = pos_attention_weight
 
-        self.combine_time_dense = nn.Linear(1, 1)
+        self.combine_time_dense = nn.Linear(num_filters, num_filters)
 
     def forward(self, latents, positions, latents_frames):
         batch_size = latents.shape[0]
@@ -51,42 +49,24 @@ class MultiheadAttention(pl.LightningModule):
             positions, self.number_of_heads
         )
 
-        attention = torch.cat(
-            [attention_lat, attention_pos * self.pos_attention_weight], dim=0
-        )
+        attention = torch.cat([attention_lat, attention_pos], dim=0)
         attention = torch.mean(attention, dim=0, keepdim=True)
 
-        # attention = self.combine_time_dense(torch.unsqueeze(attention, dim=-1))
+        attention += (1 - mask) * -10e9
+        attention = torch.nn.functional.softmax(attention, dim=2)
+        attention = torch.mean(attention, axis=0, keepdim=True)
 
-        normalized_attention = torch.nn.functional.softmax(
-            attention + (1 - mask) * -10e9 / self.softmax_factor, dim=2
-        )
-        normalized_attention = torch.mean(normalized_attention, axis=0, keepdim=True)
-
-        add_eye = torch.eye(
-            normalized_attention.shape[1], device=normalized_attention.device
-        )
-        updated_latents = (
-            torch.matmul(normalized_attention + add_eye, updated_latents) / 2
-        )
-
-        f = 0.0
-        updated_latents_pos = torch.matmul(
-            normalized_attention * f + add_eye, updated_latents_pos
-        ) / (1 + f)
-
+        add_eye = torch.eye(attention.shape[1], device=attention.device)
+        updated_latents = torch.matmul(attention + add_eye, updated_latents) / 2
         updated_latents = updated_latents.view(-1, self.number_of_filters)
-        # updated_latents_pos = updated_latents_pos.view(-1, self.number_of_filters)
+
+        updated_latents = self.combine_time_dense(updated_latents)
 
         updated_latents = updated_latents.view(
             batch_size * timesteps, -1, updated_latents.shape[-1]
         )
 
-        updated_latents_pos = updated_latents_pos.view(
-            batch_size * timesteps, -1, updated_latents_pos.shape[-1]
-        )
-
-        return [updated_latents, updated_latents_pos, normalized_attention]
+        return [updated_latents, attention_pos]
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=1e-5)

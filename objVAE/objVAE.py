@@ -186,8 +186,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             [
                 x_coord,
                 y_coord,
-                (x_coord - 64) * -1,
-                (y_coord - 64) * -1,
+                (x_coord - x.shape[2]) * -1,
+                (y_coord - x.shape[3]) * -1,
             ],
             dim=2,
         )
@@ -205,11 +205,13 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             true_batch_size, timesteps, positional_embeddings.shape[1], -1
         )
 
-        new_latents, attention = self.time_attention(
+        new_latents, new_pos, attention = self.time_attention(
             new_latents, positional_embeddings, times
         )
 
         if self.attention:
+            x_coord = new_pos[:, :, 0]
+            y_coord = new_pos[:, :, 1]
             latents = new_latents
 
         # repeat latents to match the size of input image

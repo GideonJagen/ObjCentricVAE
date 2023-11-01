@@ -42,7 +42,6 @@ def norm(norm: str, num_channels: int):
 
 
 def encoder_block(in_filters, out_filters, act_str, norm_str, norm_first):
-
     return nn.Sequential(
         nn.Conv2d(in_filters, out_filters, 3, 2, 1),
         activation(act_str),
@@ -113,7 +112,6 @@ class objBG(pl.LightningModule):
         )
 
     def forward(self, x):
-
         # interpolate x to self.image_size
         reshaped = x
         if x.shape[-1] != self.image_size or x.shape[-2] != self.image_size:
@@ -277,7 +275,6 @@ class BroadcastDecoder(nn.Module):
         )
 
     def forward(self, z, width, height):
-
         # broadcast z to 3-D
         # (B, hidden_dim + 2, w, h)
         z = self.broadcast(z, width, height)
