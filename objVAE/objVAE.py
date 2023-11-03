@@ -17,10 +17,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
     def __init__(
         self,
         num_entities,
-        attention_model=None,
         beta=0.1,
         latent_dim=12,
-        attention=True,
         single_decoder=True,
         combine_method="sum",
         topk_select_method="max",
@@ -36,7 +34,6 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         self.num_entities = num_entities
         self.beta = beta
         self.latent_dim = latent_dim
-        self.attention = attention
         self.combine_method = combine_method
         self.object_radius = object_radius
         self.single_decoder = single_decoder
@@ -51,10 +48,6 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
 
         actual_latent_dim = latent_dim * 2 + 1
         decoder_latent_dim = latent_dim
-
-        self.time_attention = attention_model
-        if self.time_attention == None:
-            self.time_attention = MultiheadAttention(num_filters=latent_dim + 1)
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1),
@@ -181,39 +174,6 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             :, :, 1
         ] * self.position_prediction_scale
 
-        # stack x and y aswell as x and y flipped
-        positional_embeddings = torch.stack(
-            [
-                x_coord,
-                y_coord,
-                (x_coord - x.shape[2]) * -1,
-                (y_coord - x.shape[3]) * -1,
-            ],
-            dim=2,
-        )
-
-        # Add time of every frame to be for masking in attention
-        times = torch.arange(0, timesteps, device=x.device, dtype=torch.int32)
-        times = torch.unsqueeze(times.repeat(true_batch_size), -1).repeat(
-            1, self.num_entities
-        )
-        times = times.view(true_batch_size, timesteps, latents.shape[1], -1)
-
-        # Self attention between latents and latents one time step in the future and past
-        new_latents = latents.view(true_batch_size, timesteps, latents.shape[1], -1)
-        positional_embeddings = positional_embeddings.view(
-            true_batch_size, timesteps, positional_embeddings.shape[1], -1
-        )
-
-        new_latents, new_pos, attention = self.time_attention(
-            new_latents, positional_embeddings, times
-        )
-
-        if self.attention:
-            x_coord = new_pos[:, :, 0]
-            y_coord = new_pos[:, :, 1]
-            latents = new_latents
-
         # repeat latents to match the size of input image
         # (batch_size, num_entities, latent_dim, 1, 1) -> (batch_size, num_entities, latent_dim, x.shape[2], x.shape[3]
         latents = latents[:, :, None, :].repeat(1, 1, x.shape[2] * x.shape[3], 1)
@@ -302,7 +262,6 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             delta_xy_pred,
             mu,
             logvar,
-            attention,
             torch.squeeze(xy_coord),
         ]
 
@@ -369,10 +328,8 @@ class MEVAE(pl.LightningModule):
     def __init__(
         self,
         num_entities,
-        attention_model=None,
         beta=0.1,
         latent_dim=12,
-        attention=True,
         combine_method="sum",
         topk_select_method="max",
         object_radius=12,
@@ -389,10 +346,8 @@ class MEVAE(pl.LightningModule):
 
         self.model = MultiEntityVariationalAutoEncoder(
             num_entities,
-            attention_model,
             beta,
             latent_dim=latent_dim,
-            attention=attention,
             combine_method=combine_method,
             topk_select_method=topk_select_method,
             object_radius=object_radius,
@@ -416,7 +371,6 @@ class MEVAE(pl.LightningModule):
             xy_pred,
             mu,
             logvar,
-            attention,
             xy,
         ) = self(x)
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
@@ -435,7 +389,6 @@ class MEVAE(pl.LightningModule):
             xy_pred,
             mu,
             logvar,
-            attention,
             xy,
         ) = self(x)
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
@@ -491,7 +444,6 @@ class MEVAE(pl.LightningModule):
             xy_pred,
             mu,
             logvar,
-            attention,
             xy,
         ) = self.model(sequence)
 

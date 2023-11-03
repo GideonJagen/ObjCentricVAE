@@ -25,7 +25,7 @@ class MultiheadAttention(pl.LightningModule):
         self.number_of_filters = num_filters
         self.pos_attention_weight = pos_attention_weight
 
-        self.combine_time_dense = nn.Linear(1, 1)
+        self.combine_time_dense = nn.Linear(num_filters, num_filters)
 
     def forward(self, latents, positions, latents_frames):
         batch_size = latents.shape[0]
@@ -56,8 +56,6 @@ class MultiheadAttention(pl.LightningModule):
         )
         attention = torch.mean(attention, dim=0, keepdim=True)
 
-        # attention = self.combine_time_dense(torch.unsqueeze(attention, dim=-1))
-
         normalized_attention = torch.nn.functional.softmax(
             attention + (1 - mask) * -10e9 / self.softmax_factor, dim=2
         )
@@ -77,6 +75,8 @@ class MultiheadAttention(pl.LightningModule):
 
         updated_latents = updated_latents.view(-1, self.number_of_filters)
         # updated_latents_pos = updated_latents_pos.view(-1, self.number_of_filters)
+
+        updated_latents = self.combine_time_dense(updated_latents)
 
         updated_latents = updated_latents.view(
             batch_size * timesteps, -1, updated_latents.shape[-1]
