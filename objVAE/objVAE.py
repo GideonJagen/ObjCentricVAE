@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import pytorch_lightning as pl
-from objVAE.MultiheadAttention import MultiheadAttention
+from objVAE import MultiheadAttention
 from objVAE.bg import objBG
 
 # torch.manual_seed(0)
@@ -210,8 +210,6 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         )
 
         if self.attention:
-            x_coord = new_pos[:, :, 0]
-            y_coord = new_pos[:, :, 1]
             latents = new_latents
 
         # repeat latents to match the size of input image
