@@ -7,6 +7,8 @@ import pytorch_lightning as pl
 from objVAE import MultiheadAttention
 from objVAE.bg import objBG
 
+torch.autograd.set_detect_anomaly(True)
+
 # torch.manual_seed(0)
 # random.seed(0)
 # np.random.seed(0)
@@ -298,13 +300,11 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             torch.squeeze(pres),
             kl_divergence,
             delta_xy_pred,
-            mu,
-            logvar,
             attention,
             torch.squeeze(xy_coord),
         ]
 
-    def loss_function(self, x, x_hat, kl_divergence, mu, logvar):
+    def loss_function(self, x, x_hat, kl_divergence):
         # reconstruction_loss = torch.mean(torch.abs(error))
         recon_loss = F.mse_loss(x_hat, x)
 
@@ -380,6 +380,7 @@ class MEVAE(pl.LightningModule):
         decoder_num_layers=3,
         encoder_num_layers=3,
         glimpse_size=32,
+        background_model=None,
     ):
         super().__init__()
 
@@ -402,47 +403,99 @@ class MEVAE(pl.LightningModule):
             glimpse_size=glimpse_size,
         )
 
+        self.background_model = background_model
+
     def forward(self, x):
-        return self.model(x)
+        if self.background_model:
+            background, background_z, background_kl = self.background_model(x)
+            x = x - background
+        else:
+            background = torch.zeros_like(x)
+            background_kl = 0
+
+        (
+            x_hat,
+            indices,
+            z_pres,
+            kl_divergence,
+            xy_pred,
+            attention,
+            xy,
+        ) = self.model(x)
+
+        recon = x_hat + background
+        kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
+
+        kl_divergence = torch.stack(kl_divergence).mean()
+
+        return (
+            recon,
+            kl_divergence,
+            background_kl,
+            xy,
+            background,
+            x_hat,
+            z_pres,
+            attention,
+        )
 
     def training_step(self, x, batch_idx):
         (
-            x_hat,
-            indices,
-            z_pres,
+            recon,
             kl_divergence,
-            xy_pred,
-            mu,
-            logvar,
-            attention,
+            background_kl,
             xy,
+            background,
+            x_hat,
+            z_pres,
+            attention,
         ) = self(x)
-        kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
 
-        kl_divergence = torch.stack(kl_divergence)
-        loss_dict = self.model.loss_function(x, x_hat, kl_divergence, mu, logvar)
-        self.log_dict(loss_dict, on_epoch=True, prog_bar=True)
-        return loss_dict["loss"]
+        loss = self.loss_function(
+            x,
+            recon,
+            kl_divergence,
+            background_kl,
+        )
+
+        return loss
 
     def validation_step(self, x, batch_idx):
         (
-            x_hat,
-            indices,
-            z_pres,
+            recon,
             kl_divergence,
-            xy_pred,
-            mu,
-            logvar,
-            attention,
+            background_kl,
             xy,
+            background,
+            x_hat,
+            z_pres,
+            attention,
         ) = self(x)
-        kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
 
-        kl_divergence = torch.stack(kl_divergence)
-
-        loss_dict = self.model.loss_function(x, x_hat, kl_divergence, mu, logvar)
+        loss = self.loss_function(x, recon, kl_divergence, background_kl)
         # self.log_dict(loss_dict, on_step=True, on_epoch=True, prog_bar=True)
-        return loss_dict["loss"]
+        return loss
+
+    def loss_function(self, x, reconstruction, kl_foreground, kl_background):
+        kl = kl_foreground + kl_background
+        recon_loss = F.mse_loss(reconstruction, x)
+
+        loss = recon_loss + kl * self.model.beta
+
+        self.log_dict(
+            {
+                "loss": loss,
+                "recon_loss": recon_loss,
+                "kl_loss": kl,
+                "kl_for": kl_foreground,
+                "kl_back": kl_background,
+            },
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+        )
+
+        return loss
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=2e-4)
@@ -483,19 +536,17 @@ class MEVAE(pl.LightningModule):
         sequence = sequence.to(self.model.device)
         (
             recon,
-            indices,
-            pres,
             kl_divergence,
-            xy_pred,
-            mu,
-            logvar,
-            attention,
+            background_kl,
             xy,
-        ) = self.model(sequence)
+            background,
+            x_hat,
+            z_pres,
+            attention,
+        ) = self(sequence)
 
-        # x = x.detach().cpu().numpy()
         recon = recon.detach().cpu().numpy()
-        pres = pres.detach().cpu().numpy()
+        pres = z_pres.detach().cpu().numpy()
         xy = xy.detach().cpu().numpy()
 
         combine_map_v = []

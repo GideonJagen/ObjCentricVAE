@@ -6,6 +6,8 @@ from torch.nn import functional as F
 from torch.distributions.normal import Normal
 from torch.distributions.kl import kl_divergence
 
+torch.autograd.set_detect_anomaly(True)
+
 
 def activation(act: str):
     if act == "relu":
@@ -113,6 +115,13 @@ class objBG(pl.LightningModule):
 
     def forward(self, x):
         # interpolate x to self.image_size
+
+        true_batch_size = x.shape[0]
+        timesteps = x.shape[1]
+        batch_size = true_batch_size * timesteps
+
+        x = x.view(batch_size, x.shape[2], x.shape[3], x.shape[4])
+
         reshaped = x
         if x.shape[-1] != self.image_size or x.shape[-2] != self.image_size:
             reshaped = F.interpolate(
@@ -137,6 +146,8 @@ class objBG(pl.LightningModule):
         kl_bg = kl_divergence(z_bg_posterior, z_bg_prior).sum(dim=1).mean()
 
         bg = self.decoder(z_bg, x.shape[-2], x.shape[-1])
+
+        bg = bg.view(true_batch_size, timesteps, x.shape[1], x.shape[2], x.shape[3])
 
         return bg, z_bg, kl_bg
 
