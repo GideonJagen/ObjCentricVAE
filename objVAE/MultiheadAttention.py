@@ -11,9 +11,10 @@ class MultiheadAttention(pl.LightningModule):
         max_t=1,
         softmax_factor=1,
         number_of_heads=1,
-        num_filters=12,
+        num_latents=12,
+        num_positional=4,
         attention_mechanism="cosine-similarity",
-        pos_attention_weight=100,  # Weight between position attention and morphology attention
+        pos_attention_weight=0,  # Weight between position attention and morphology attention
         **kwargs
     ):
         super(MultiheadAttention, self).__init__()
@@ -22,10 +23,42 @@ class MultiheadAttention(pl.LightningModule):
         self.max_t = max_t
         self.softmax_factor = softmax_factor
         self.number_of_heads = number_of_heads
-        self.number_of_filters = num_filters
+        self.num_latents = num_latents
         self.pos_attention_weight = pos_attention_weight
+        self.attention_iters = 2
 
         self.combine_time_dense = nn.Linear(1, 1)
+
+        self.num_features = num_latents + num_positional
+        self.number_of_heads = 1
+        self.number_of_filters = num_latents + num_positional - 1
+
+        self.to_q = nn.Linear(self.num_features, self.num_features)
+        self.to_k = nn.Linear(self.num_features, self.num_features)
+        self.to_v = nn.Linear(self.num_features, self.num_features)
+
+        self.gru = nn.GRU(self.num_features, self.num_features, batch_first=True)
+
+    """
+    def forward(self, latents, positions, latents_frames):
+        batch_size = latents.shape[0]
+        timesteps = latents.shape[1]
+
+        time_mask = self._create_time_mask(latents_frames, max_t=self.max_t)
+
+        eye = torch.eye(batch_size, dtype=torch.float32, device=time_mask.device)
+        eye = eye.repeat_interleave(timesteps * latents.shape[2], dim=0)
+        batch_mask = eye.repeat_interleave(timesteps * latents.shape[2], dim=1)
+
+        time_mask *= batch_mask
+
+        # Edges between the supernodes:
+        updated_latents, attention_lat = self.new_time_attention(
+            torch.cat((latents, positions), dim=-1), self.number_of_heads
+        )
+
+        return updated_latents, attention_lat
+    """
 
     def forward(self, latents, positions, latents_frames):
         batch_size = latents.shape[0]
@@ -58,10 +91,10 @@ class MultiheadAttention(pl.LightningModule):
 
         # attention = self.combine_time_dense(torch.unsqueeze(attention, dim=-1))
 
-        normalized_attention = torch.nn.functional.softmax(
-            attention + (1 - mask) * -10e9 / self.softmax_factor, dim=2
-        )
-        normalized_attention = torch.mean(normalized_attention, axis=0, keepdim=True)
+        # normalized_attention = torch.nn.functional.softmax(
+        #    attention + (1 - mask) * -10e9 / self.softmax_factor, dim=2
+        # )
+        normalized_attention = torch.mean(attention * mask, axis=0, keepdim=True)
 
         add_eye = torch.eye(
             normalized_attention.shape[1], device=normalized_attention.device
@@ -123,6 +156,28 @@ class MultiheadAttention(pl.LightningModule):
             raise NotImplementedError
 
         return latents, attention
+
+    def new_time_attention(self, latents, number_of_heads=1):
+        number_of_filters = latents.shape[-1]
+        projection_dim = number_of_filters // number_of_heads
+
+        latents = latents.view(-1, number_of_heads, projection_dim)
+        latents = latents.transpose(0, 1)
+
+        k = self.to_k(latents)
+        v = self.to_v(latents)
+
+        for i in range(self.iters):
+            q = self.to_q(latents)
+
+            attention = torch.matmul(q, k.transpose(1, 2))
+            attention = torch.nn.functional.softmax(attention, dim=-1)
+
+            attention = torch.matmul(attention, v)
+
+            updated_latents = self.gru(attention, latents)[0]
+
+        return updated_latents, attention
 
     def _distance_matrix_heads(self, matrix_a, matrix_b):
         expanded_a = matrix_a.unsqueeze(2)

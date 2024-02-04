@@ -72,6 +72,7 @@ def run_test(
             x_hat,
             z_pres,
             attention,
+            pres_loss,
         ) = model(x)
 
         x = x.detach().cpu().numpy()

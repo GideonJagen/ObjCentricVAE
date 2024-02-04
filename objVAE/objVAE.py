@@ -51,12 +51,12 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         self.position_representation_scale = 1
         self.position_prediction_scale = 1
 
-        actual_latent_dim = latent_dim * 2 + 1
+        actual_latent_dim = latent_dim * 2 + 2
         decoder_latent_dim = latent_dim
 
         self.time_attention = attention_model
-        if self.time_attention == None:
-            self.time_attention = MultiheadAttention(num_filters=latent_dim + 1)
+        if self.time_attention is None:
+            self.time_attention = MultiheadAttention(num_latents=latent_dim + 1)
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1),
@@ -120,7 +120,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         )
 
         z_pres = torch.sigmoid(y[:, :1]).view(batch_size, -1)
-        z_what = y[:, 1:]
+        z_what = y[:, 2:]
+        z_radius = torch.sigmoid(y[:, 1:2]).view(batch_size, -1)
 
         mu = z_what[:, : self.latent_dim, :, :]
         logvar = z_what[:, self.latent_dim :, :, :]
@@ -167,6 +168,10 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         xy_pred = delta_xy_pred[torch.arange(batch_size)[:, None], :, indices]
         pres = z_pres[torch.arange(batch_size)[:, None], indices].view(
             batch_size, -1, 1, 1, 1
+        )
+
+        radius = z_radius[torch.arange(batch_size)[:, None], indices].view(
+            batch_size, -1, 1
         )
 
         # Create positial embeddings for attention
@@ -227,7 +232,9 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         grid_channel = (grid_channel - xy_coord) * self.position_representation_scale
 
         r_channel = torch.norm(grid_channel, p=2, dim=-1)
-        mask = r_channel < (self.glimpse_size * self.position_representation_scale)
+        mask = r_channel < (
+            (1 + radius) * self.glimpse_size * self.position_representation_scale
+        )
 
         reduced_grid = grid_channel[mask, :]
         reduced_latents = latents[mask, :]
@@ -237,6 +244,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         # elif self.position_embedding == "radial":
         r_channel = torch.norm(reduced_grid, p=2, dim=-1, keepdim=True)
         reduced_grid = torch.cat([reduced_grid, r_channel], dim=-1)
+        # reduced_grid = torch.cat([reduced_grid], dim=-1)
+
         # elif self.position_embedding == "sine":
         # reduced_grid = self.sine_embedding(reduced_grid)
 
@@ -282,6 +291,15 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             y = torch.max(decoded_feature_map, dim=1)[0]
         elif self.combine_method == "sum":
             y = torch.sum(decoded_feature_map, dim=1)
+        elif self.combine_method == "stacked":
+            object = pres.argmax(dim=1)
+            y = torch.stack(
+                [
+                    decoded_feature_map[b, object[b, 0, 0, 0], :, :, :]
+                    for b in range(timesteps)
+                ],
+                dim=0,
+            )
         else:
             raise NotImplementedError
 
@@ -292,8 +310,6 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
 
         presence_loss = (z_pres - 1) ** 2 * self.presence_bias
 
-        kl_divergence += presence_loss
-
         return [
             y,
             indices,
@@ -302,6 +318,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             delta_xy_pred,
             attention,
             torch.squeeze(xy_coord),
+            presence_loss,
         ]
 
     def loss_function(self, x, x_hat, kl_divergence):
@@ -406,8 +423,19 @@ class MEVAE(pl.LightningModule):
         self.background_model = background_model
 
     def forward(self, x):
+        (
+            x_hat,
+            indices,
+            z_pres,
+            kl_divergence,
+            xy_pred,
+            attention,
+            xy,
+            presence_loss,
+        ) = self.model(x)
+
         if self.background_model:
-            background, background_z, background_kl = self.background_model(x)
+            background, background_z, background_kl = self.background_model(x - x_hat)
             x = x - background
         else:
             background = torch.zeros_like(x)
@@ -421,12 +449,16 @@ class MEVAE(pl.LightningModule):
             xy_pred,
             attention,
             xy,
+            presence_loss,
         ) = self.model(x)
 
+        # recon = torch.max(torch.stack((x_hat, background)), dim=0)[0]
         recon = x_hat + background
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
+        presence_loss = [pres[idx] for pres, idx in zip(presence_loss, indices)]
 
         kl_divergence = torch.stack(kl_divergence).mean()
+        presence_loss = torch.stack(presence_loss).mean()
 
         return (
             recon,
@@ -437,6 +469,7 @@ class MEVAE(pl.LightningModule):
             x_hat,
             z_pres,
             attention,
+            presence_loss,
         )
 
     def training_step(self, x, batch_idx):
@@ -449,14 +482,10 @@ class MEVAE(pl.LightningModule):
             x_hat,
             z_pres,
             attention,
+            presence_loss,
         ) = self(x)
 
-        loss = self.loss_function(
-            x,
-            recon,
-            kl_divergence,
-            background_kl,
-        )
+        loss = self.loss_function(x, recon, kl_divergence, background_kl, presence_loss)
 
         return loss
 
@@ -470,17 +499,20 @@ class MEVAE(pl.LightningModule):
             x_hat,
             z_pres,
             attention,
+            presence_loss,
         ) = self(x)
 
-        loss = self.loss_function(x, recon, kl_divergence, background_kl)
+        loss = self.loss_function(x, recon, kl_divergence, background_kl, presence_loss)
         # self.log_dict(loss_dict, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
-    def loss_function(self, x, reconstruction, kl_foreground, kl_background):
+    def loss_function(
+        self, x, reconstruction, kl_foreground, kl_background, presence_loss
+    ):
         kl = kl_foreground + kl_background
         recon_loss = F.mse_loss(reconstruction, x)
 
-        loss = recon_loss + kl * self.model.beta
+        loss = recon_loss + kl * self.model.beta + presence_loss
 
         self.log_dict(
             {
