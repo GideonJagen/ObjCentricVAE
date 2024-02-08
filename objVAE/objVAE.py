@@ -364,6 +364,117 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         indices = indices.detach()
         return indices
 
+    def extract_latents(self, x):
+        true_batch_size = x.shape[0]
+        timesteps = x.shape[1]
+        batch_size = true_batch_size * timesteps
+
+        x = x.view(batch_size, x.shape[2], x.shape[3], x.shape[4])
+
+        y = self.encoder(x)
+
+        x_mass = torch.abs(x)
+
+        # resize x_mass
+        x_mass = F.interpolate(
+            x_mass,
+            size=(y.shape[2], y.shape[3]),
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        z_pres = torch.sigmoid(y[:, :1]).view(batch_size, -1)
+        z_what = y[:, 1:]
+
+        mu = z_what[:, : self.latent_dim, :, :]
+        logvar = z_what[:, self.latent_dim :, :, :]
+
+        x_range = torch.arange(0, x.shape[2], device=x.device, dtype=torch.float32)
+        y_range = torch.arange(0, x.shape[3], device=x.device, dtype=torch.float32)
+        x_grid, y_grid = torch.meshgrid(x_range, y_range)
+
+        std = torch.exp(0.5 * logvar)
+
+        # Reparametrization
+        parametrization = torch.randn_like(std) * std + mu
+
+        delta_xy_pred = parametrization[:, :2].view(batch_size, 2, -1)
+        parametrization = parametrization[:, 2:].view(
+            batch_size, self.latent_dim - 2, -1
+        )
+
+        # Calculate the KL divergence from the prior of gaussian distribution with mean 0 and std 1
+        # to the posterior of the gaussian distribution with mean mu and std std
+        # KL divergence is calculated as 0.5 * sum(1 + log(std^2) - mu^2 - std^2)
+        kl_divergence = -0.5 * torch.sum(1 + logvar - mu**2 - std**2, dim=1)
+        kl_divergence = kl_divergence.view(batch_size, -1)
+        # find the i,j indices of the max value num_entities elements in the kl_divergence tensorimage_size
+        # these indices will be used to select the num_entities most important entities
+
+        score = kl_divergence**self.kl_importance * x_mass.view(batch_size, -1) ** (
+            1 - self.kl_importance
+        )
+        # **self.kl_importance * x_mass.view(batch_size, -1) ** (
+        #    1 - self.kl_importance
+        # )
+        if self.topk_select_method == "random":
+            indices = self.sample_topk(score)
+        elif self.topk_select_method == "max":
+            indices = self.select_topk(score)
+        else:
+            raise NotImplementedError
+
+        # indices = indices.detach()
+        latents = parametrization[torch.arange(batch_size)[:, None], :, indices]
+        xy_pred = delta_xy_pred[torch.arange(batch_size)[:, None], :, indices]
+        pres = z_pres[torch.arange(batch_size)[:, None], indices].view(
+            batch_size, -1, 1, 1, 1
+        )
+
+        # Create positial embeddings for attention
+        # center the grid channel around the coordinates of the entities
+        x_coord = indices // y.shape[3]
+        y_coord = indices % y.shape[3]
+
+        # add 0.5 to the coordinates to center the grid channel around the coordinates of the entities
+        # scale the coordinates to match the size of the input image and add predicted offset
+        x_coord = (x_coord + 0.5) * x.shape[2] / y.shape[2] - xy_pred[
+            :, :, 0
+        ] * self.position_prediction_scale
+        y_coord = (y_coord + 0.5) * x.shape[3] / y.shape[3] - xy_pred[
+            :, :, 1
+        ] * self.position_prediction_scale
+
+        # stack x and y aswell as x and y flipped
+        positional_embeddings = torch.stack(
+            [
+                x_coord,
+                y_coord,
+                (x_coord - x.shape[2]) * -1,
+                (y_coord - x.shape[3]) * -1,
+            ],
+            dim=2,
+        )
+
+        # Add time of every frame to be for masking in attention
+        times = torch.arange(0, timesteps, device=x.device, dtype=torch.int32)
+        times = torch.unsqueeze(times.repeat(true_batch_size), -1).repeat(
+            1, self.num_entities
+        )
+        times = times.view(true_batch_size, timesteps, latents.shape[1], -1)
+
+        # Self attention between latents and latents one time step in the future and past
+        new_latents = latents.view(true_batch_size, timesteps, latents.shape[1], -1)
+        positional_embeddings = positional_embeddings.view(
+            true_batch_size, timesteps, positional_embeddings.shape[1], -1
+        )
+
+        new_latents, new_pos, attention = self.time_attention(
+            new_latents, positional_embeddings, times
+        )
+
+        return latents, new_latents, pres
+
 
 class MEVAE(pl.LightningModule):
     def __init__(
