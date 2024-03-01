@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as transforms
 import pytorch_lightning as pl
 
 
@@ -13,7 +11,7 @@ class MultiheadAttention(pl.LightningModule):
         number_of_heads=1,
         num_filters=12,
         attention_mechanism="cosine-similarity",
-        pos_attention_weight=100,  # Weight between position attention and morphology attention
+        pos_attention_weight=1,  # Weight between position attention and morphology attention
         **kwargs
     ):
         super(MultiheadAttention, self).__init__()
@@ -56,10 +54,12 @@ class MultiheadAttention(pl.LightningModule):
         )
         attention = torch.mean(attention, dim=0, keepdim=True)
 
-        # attention = self.combine_time_dense(torch.unsqueeze(attention, dim=-1))
+        # attention = torch.squeeze(
+        #    self.combine_time_dense(torch.unsqueeze(attention, dim=-1)), dim=-1
+        # )
 
         normalized_attention = torch.nn.functional.softmax(
-            attention + (1 - mask) * -10e9 / self.softmax_factor, dim=2
+            (attention + (1 - mask) * -10e9) / self.softmax_factor, dim=2
         )
         normalized_attention = torch.mean(normalized_attention, axis=0, keepdim=True)
 
@@ -119,10 +119,18 @@ class MultiheadAttention(pl.LightningModule):
             attention = self._cosine_similarity(latents)
         elif self.attention_mechanism == "dot-product":
             attention = torch.matmul(latents, latents.transpose(1, 2))
+        elif self.attention_mechanism == "euclidean":
+            attention = torch.div(1, self._vector_norm(latents, latents))
+            assert not torch.isnan(attention).any()
+
         else:
             raise NotImplementedError
 
         return latents, attention
+
+    def _vector_norm(self, vector1, vector2):
+        dist = torch.cdist(vector1, vector2, p=2)
+        return dist
 
     def _distance_matrix_heads(self, matrix_a, matrix_b):
         expanded_a = matrix_a.unsqueeze(2)

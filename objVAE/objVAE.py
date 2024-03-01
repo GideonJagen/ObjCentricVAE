@@ -2,10 +2,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as transforms
 import pytorch_lightning as pl
 from objVAE.MultiheadAttention import MultiheadAttention
-from objVAE.bg import objBG
 
 # torch.manual_seed(0)
 # random.seed(0)
@@ -25,10 +23,11 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         combine_method="sum",
         topk_select_method="max",
         object_radius=12,
-        decoder="linnear",
+        decoder="linear",
         decoder_feature_size=56,
         decoder_num_layers=3,
-        encoder_num_layers=3,
+        encoder_pooling_layers=3,
+        encoder_conv_layers=3,
         glimpse_size=32,
     ):
         super(MultiEntityVariationalAutoEncoder, self).__init__()
@@ -53,7 +52,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         decoder_latent_dim = latent_dim
 
         self.time_attention = attention_model
-        if self.time_attention == None:
+        if self.time_attention is None:
             self.time_attention = MultiheadAttention(num_filters=latent_dim + 1)
 
         self.encoder = nn.Sequential(
@@ -66,7 +65,14 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
                     nn.ReLU(),
                     nn.MaxPool2d(2, 2),
                 )
-                for _ in range(encoder_num_layers - 1)
+                for _ in range(encoder_pooling_layers - 1)
+            ],
+            *[
+                nn.Sequential(
+                    nn.Conv2d(16, 16, 3, padding=1),
+                    nn.ReLU(),
+                )
+                for _ in range(encoder_conv_layers)
             ],
             nn.Conv2d(16, 32, 3, padding=1),
             nn.ReLU(),
@@ -75,13 +81,38 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             nn.Conv2d(32, actual_latent_dim, 3, padding=1),
         )
 
+        self.decoder_conv = nn.Sequential(
+            nn.ConvTranspose2d(actual_latent_dim, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, 3, padding=1),
+            *[
+                nn.Sequential(
+                    nn.ConvTranspose2d(16, 16, 3, padding=1),
+                    nn.ReLU(),
+                )
+                for _ in range(encoder_conv_layers)
+            ],
+            *[
+                nn.Sequential(
+                    nn.ConvTranspose2d(16, 16, 3, padding=1),
+                    nn.ReLU(),
+                    nn.Upsample(scale_factor=2),
+                )
+                for _ in range(encoder_pooling_layers - 1)
+            ],
+            nn.Upsample(scale_factor=2),
+            nn.ConvTranspose2d(16, 1, 3, padding=1),
+        )
+
         def decoder_block(in_filters, out_filters):
             return nn.Sequential(
                 nn.Linear(in_filters, out_filters),
                 nn.ReLU(),
             )
 
-        self.decoder_1 = nn.Sequential(
+        self.decoder_linear = nn.Sequential(
             *[
                 decoder_block(
                     decoder_latent_dim + 1,
@@ -200,6 +231,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         times = times.view(true_batch_size, timesteps, latents.shape[1], -1)
 
         # Self attention between latents and latents one time step in the future and past
+        assert not torch.isnan(latents).any()
+
         new_latents = latents.view(true_batch_size, timesteps, latents.shape[1], -1)
         positional_embeddings = positional_embeddings.view(
             true_batch_size, timesteps, positional_embeddings.shape[1], -1
@@ -250,7 +283,12 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         #    batch_size * self.num_entities, -1, x.shape[2], x.shape[3]
         # )
 
-        pixel_map = self.decoder_1(intermediate_feature_map)
+        if self.decoder == "linear":
+            pixel_map = self.decoder_linear(intermediate_feature_map)
+        elif self.decoder == "conv":
+            pixel_map = self.decoder_conv(intermediate_feature_map)
+        else:
+            raise NotImplementedError
 
         pixel_map_tensor = torch.zeros(
             batch_size, self.num_entities, x.shape[2] * x.shape[3], device=x.device
@@ -280,6 +318,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         # reduce entity dimension by taking max
         if self.combine_method == "max":
             y = torch.max(decoded_feature_map, dim=1)[0]
+        elif self.combine_method == "min":
+            y = torch.min(decoded_feature_map, dim=1)[0]
         elif self.combine_method == "sum":
             y = torch.sum(decoded_feature_map, dim=1)
         else:
@@ -313,7 +353,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         # KL divergence loss
         kl_divergence_loss = kl_divergence.mean()
 
-        ## MN weighting
+        # MN weighting
         # weight_MN = x.shape[1] * x.shape[2] * x.shape[3] / 12
 
         # Total loss
@@ -396,7 +436,9 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         std = torch.exp(0.5 * logvar)
 
         # Reparametrization
-        parametrization = torch.randn_like(std) * std + mu
+        # parametrization = torch.randn_like(std) * std + mu
+        # Use Mu as parametrization to remove randomness in the latents
+        parametrization = mu
 
         delta_xy_pred = parametrization[:, :2].view(batch_size, 2, -1)
         parametrization = parametrization[:, 2:].view(
@@ -473,7 +515,102 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             new_latents, positional_embeddings, times
         )
 
-        return latents, new_latents, pres
+        xy_coord = torch.stack([x_coord, y_coord], dim=-1).view(batch_size, -1, 1, 2)
+
+        return latents, new_latents, pres, torch.squeeze(xy_coord)
+
+    def decode_from_latents(self, latents, image_shape, grid_channel):
+        batch_size = latents.shape[0]
+
+        # repeat latents to match the size of input image
+        # (batch_size, num_entities, latent_dim, 1, 1) -> (batch_size, num_entities, latent_dim, x.shape[2], x.shape[3]
+        latents = latents[:, :, None, :].repeat(
+            1, 1, image_shape[0] * image_shape[1], 1
+        )
+
+        # grid channel is a tensor of size (batch_size, latent_dim, 2, x.shape[2], x.shape[3])
+        # it contains the x and y coordinates of each pixel in the image
+        # grid_channel = torch.stack([x_grid, y_grid], dim=-1).view(1, 1, -1, 2)
+
+        # xy_coord = torch.stack([x_coord, y_coord], dim=-1).view(batch_size, -1, 1, 2)
+
+        # grid_channel = (grid_channel - xy_coord) * self.position_representation_scale
+
+        r_channel = torch.norm(grid_channel, p=2, dim=-1)
+        mask = r_channel < (self.glimpse_size * self.position_representation_scale)
+
+        reduced_grid = grid_channel[mask, :]
+        reduced_latents = latents[mask, :]
+
+        # if self.position_embedding == "none":
+        #    ...
+        # elif self.position_embedding == "radial":
+        r_channel = torch.norm(reduced_grid, p=2, dim=-1, keepdim=True)
+        reduced_grid = torch.cat([reduced_grid, r_channel], dim=-1)
+        # elif self.position_embedding == "sine":
+        # reduced_grid = self.sine_embedding(reduced_grid)
+
+        # concatenate the grid channel and the latents
+        # (batch_size, num_entities, latent_dim + 2, x.shape[2], x.shape[3])
+        intermediate_feature_map = torch.cat([reduced_latents, reduced_grid], dim=-1)
+
+        # flatten batch and num_entities dimensions
+        # (batch_size * num_entities, latent_dim + 2, x.shape[2], x.shape[3])
+        # intermediate_feature_map = intermediate_feature_map.view(
+        #    batch_size * self.num_entities, -1, x.shape[2], x.shape[3]
+        # )
+
+        if self.decoder == "linear":
+            pixel_map = self.decoder_linear(intermediate_feature_map)
+        elif self.decoder == "conv":
+            pixel_map = self.decoder_conv(intermediate_feature_map)
+        else:
+            raise NotImplementedError
+
+        pixel_map_tensor = torch.zeros(
+            batch_size,
+            pixel_map.shape[1],
+            image_shape[0] * image_shape[1],
+            device=latents.device,
+        )
+
+        pixel_map_tensor[mask] = pixel_map.view(-1)
+
+        pixel_map = pixel_map_tensor.view(
+            batch_size, pixel_map.shape[1], 1, image_shape[0], image_shape[1]
+        )
+
+        weight_map = mask.view(
+            batch_size, pixel_map.shape[1], 1, image_shape[0], image_shape[1]
+        )
+
+        """
+        # unflatten batch and num_entities dimensions
+        # (batch_size, num_entities, 32, x.shape[2], x.shape[3])
+        decoded_feature_map = decoded_feature_map.view(
+            batch_size, self.num_entities, -1, x.shape[2], x.shape[3]
+        )
+        """
+
+        # Multiply each objects feature map with presence
+        decoded_feature_map = pixel_map * weight_map
+
+        # reduce entity dimension by taking max
+        if self.combine_method == "max":
+            y = torch.max(decoded_feature_map, dim=1)[0]
+        elif self.combine_method == "min":
+            y = torch.min(decoded_feature_map, dim=1)[0]
+        elif self.combine_method == "sum":
+            y = torch.sum(decoded_feature_map, dim=1)
+        else:
+            raise NotImplementedError
+
+        if not self.single_decoder:
+            y = self.decoder_2(y)
+
+        y = y.view(batch_size, image_shape[0], image_shape[1])
+
+        return y
 
 
 class MEVAE(pl.LightningModule):
@@ -488,10 +625,11 @@ class MEVAE(pl.LightningModule):
         topk_select_method="max",
         object_radius=12,
         single_decoder=True,
-        decoder="linnear",
+        decoder="linear",
         decoder_feature_size=56,
         decoder_num_layers=3,
-        encoder_num_layers=3,
+        encoder_pooling_layers=3,
+        encoder_conv_layers=3,
         glimpse_size=32,
     ):
         super().__init__()
@@ -511,7 +649,8 @@ class MEVAE(pl.LightningModule):
             decoder=decoder,
             decoder_feature_size=decoder_feature_size,
             decoder_num_layers=decoder_num_layers,
-            encoder_num_layers=encoder_num_layers,
+            encoder_pooling_layers=encoder_pooling_layers,
+            encoder_conv_layers=encoder_conv_layers,
             glimpse_size=glimpse_size,
         )
 
@@ -560,7 +699,7 @@ class MEVAE(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=2e-4)
 
-    ## Other methods##
+    # Other methods#
     def _combine_nodes(self, attention_to_next, combine_map_v, remove_map_v, i_combine):
         new_attention = []
         for j, row in enumerate(combine_map_v[i_combine]):
