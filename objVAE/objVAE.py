@@ -51,6 +51,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         actual_latent_dim = latent_dim * 2 + 1
         decoder_latent_dim = latent_dim
 
+        self.use_radial = False
+
         self.time_attention = attention_model
         if self.time_attention is None:
             self.time_attention = MultiheadAttention(num_filters=latent_dim + 1)
@@ -115,7 +117,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         self.decoder_linear = nn.Sequential(
             *[
                 decoder_block(
-                    decoder_latent_dim + 1,
+                    decoder_latent_dim + 1 if self.use_radial else decoder_latent_dim,
                     decoder_feature_size,
                 ),
                 *[
@@ -268,8 +270,9 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         # if self.position_embedding == "none":
         #    ...
         # elif self.position_embedding == "radial":
-        r_channel = torch.norm(reduced_grid, p=2, dim=-1, keepdim=True)
-        reduced_grid = torch.cat([reduced_grid, r_channel], dim=-1)
+        if self.use_radial:
+            r_channel = torch.norm(reduced_grid, p=2, dim=-1, keepdim=True)
+            reduced_grid = torch.cat([reduced_grid, r_channel], dim=-1)
         # elif self.position_embedding == "sine":
         # reduced_grid = self.sine_embedding(reduced_grid)
 
@@ -330,15 +333,14 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
 
         y = y.view(true_batch_size, timesteps, x.shape[1], x.shape[2], x.shape[3])
 
-        presence_loss = (z_pres - 1) ** 2 * self.presence_bias
-
-        kl_divergence += presence_loss
+        presence_loss = (z_pres - 1) ** 2
 
         return [
             y,
             indices,
             torch.squeeze(pres),
             kl_divergence,
+            presence_loss,
             delta_xy_pred,
             mu,
             logvar,
@@ -346,24 +348,26 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             torch.squeeze(xy_coord),
         ]
 
-    def loss_function(self, x, x_hat, kl_divergence, mu, logvar):
+    def loss_function(self, x, x_hat, kl_divergence, presence_loss, mu, logvar):
         # reconstruction_loss = torch.mean(torch.abs(error))
         recon_loss = F.mse_loss(x_hat, x)
 
-        # KL divergence loss
-        kl_divergence_loss = kl_divergence.mean()
-
+        # KL divergence & presence loss
+        kl_divergence_loss = kl_divergence.mean() * self.presence_bias
+        presence_loss_mean = presence_loss.mean() * self.beta
         # MN weighting
         # weight_MN = x.shape[1] * x.shape[2] * x.shape[3] / 12
 
         # Total loss
-        loss = recon_loss + kl_divergence_loss * self.beta
+        loss = recon_loss + presence_loss_mean + kl_divergence_loss
 
         return {
             "loss": loss,
             "reconstruction_loss": recon_loss,
             "KLD": kl_divergence_loss,
             "weighted_KLD": kl_divergence_loss * self.beta,
+            "presence_loss": presence_loss_mean,
+            "weighted_presence_loss": presence_loss_mean * self.presence_bias,
         }
 
     def select_topk(self, score, topk=None):
@@ -545,8 +549,9 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         # if self.position_embedding == "none":
         #    ...
         # elif self.position_embedding == "radial":
-        r_channel = torch.norm(reduced_grid, p=2, dim=-1, keepdim=True)
-        reduced_grid = torch.cat([reduced_grid, r_channel], dim=-1)
+        if self.use_radial:
+            r_channel = torch.norm(reduced_grid, p=2, dim=-1, keepdim=True)
+            reduced_grid = torch.cat([reduced_grid, r_channel], dim=-1)
         # elif self.position_embedding == "sine":
         # reduced_grid = self.sine_embedding(reduced_grid)
 
@@ -663,6 +668,7 @@ class MEVAE(pl.LightningModule):
             indices,
             z_pres,
             kl_divergence,
+            presence_loss,
             xy_pred,
             mu,
             logvar,
@@ -670,9 +676,13 @@ class MEVAE(pl.LightningModule):
             xy,
         ) = self(x)
         kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
+        presence_loss = [pl[idx] for pl, idx in zip(presence_loss, indices)]
 
         kl_divergence = torch.stack(kl_divergence)
-        loss_dict = self.model.loss_function(x, x_hat, kl_divergence, mu, logvar)
+        presence_loss = torch.stack(presence_loss)
+        loss_dict = self.model.loss_function(
+            x, x_hat, kl_divergence, presence_loss, mu, logvar
+        )
         self.log_dict(loss_dict, on_epoch=True, prog_bar=True)
         return loss_dict["loss"]
 
@@ -682,6 +692,7 @@ class MEVAE(pl.LightningModule):
             indices,
             z_pres,
             kl_divergence,
+            presence_loss,
             xy_pred,
             mu,
             logvar,
@@ -692,7 +703,9 @@ class MEVAE(pl.LightningModule):
 
         kl_divergence = torch.stack(kl_divergence)
 
-        loss_dict = self.model.loss_function(x, x_hat, kl_divergence, mu, logvar)
+        loss_dict = self.model.loss_function(
+            x, x_hat, kl_divergence, presence_loss, mu, logvar
+        )
         # self.log_dict(loss_dict, on_step=True, on_epoch=True, prog_bar=True)
         return loss_dict["loss"]
 
