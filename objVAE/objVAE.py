@@ -675,10 +675,10 @@ class MEVAE(pl.LightningModule):
             attention,
             xy,
         ) = self(x)
-        kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
+        # kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
         presence_loss = [pl[idx] for pl, idx in zip(presence_loss, indices)]
 
-        kl_divergence = torch.stack(kl_divergence)
+        # kl_divergence = torch.stack(kl_divergence)
         presence_loss = torch.stack(presence_loss)
         loss_dict = self.model.loss_function(
             x, x_hat, kl_divergence, presence_loss, mu, logvar
@@ -699,9 +699,10 @@ class MEVAE(pl.LightningModule):
             attention,
             xy,
         ) = self(x)
-        kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
-
-        kl_divergence = torch.stack(kl_divergence)
+        # kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
+        presence_loss = [pl[idx] for pl, idx in zip(presence_loss, indices)]
+        presence_loss = torch.stack(presence_loss)
+        # kl_divergence = torch.stack(kl_divergence)
 
         loss_dict = self.model.loss_function(
             x, x_hat, kl_divergence, presence_loss, mu, logvar
