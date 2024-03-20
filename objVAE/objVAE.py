@@ -353,8 +353,8 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         recon_loss = F.mse_loss(x_hat, x)
 
         # KL divergence & presence loss
-        kl_divergence_loss = kl_divergence.mean() * self.presence_bias
-        presence_loss_mean = presence_loss.mean() * self.beta
+        kl_divergence_loss = kl_divergence.mean() * self.beta
+        presence_loss_mean = presence_loss.mean() * self.presence_bias
         # MN weighting
         # weight_MN = x.shape[1] * x.shape[2] * x.shape[3] / 12
 

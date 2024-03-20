@@ -89,9 +89,18 @@ def run_test(
 
         x = torch.unsqueeze(x, dim=0)
         x = x.to(model.device)
-        recon, indices, pres, kl_divergence, xy_pred, mu, logvar, attention, xy = model(
-            x
-        )
+        (
+            recon,
+            indices,
+            pres,
+            kl_divergence,
+            pres_loss,
+            xy_pred,
+            mu,
+            logvar,
+            attention,
+            xy,
+        ) = model(x)
 
         x = x.detach().cpu().numpy()
         recon = recon.detach().cpu().numpy()
