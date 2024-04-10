@@ -78,11 +78,15 @@ def run_test(
     testset,
     model,
     combine_radius,
+    t=1,
     plot_num=0,
     num_entities=10,
     pres_floor=0.25,
     tra_floor=0.25,
     tail_length=2,
+    include_pres=True,
+    marker_type="o",
+    facecolor="none",
 ):
     lines_v = []
     for i_seq, x in enumerate(testset):
@@ -172,20 +176,21 @@ def run_test(
                 scatter = plt.scatter(
                     yp[~remove_map_v[i].astype(bool)],
                     xp[~remove_map_v[i].astype(bool)],
-                    marker="o",
+                    marker=marker_type,
                     s=300,
                     edgecolor="r",
-                    facecolor="none",
+                    facecolor=facecolor,
                 )
                 annotations = []
-                for j, txt in enumerate(n):
-                    if remove_map_v[i][j]:
-                        continue
-                    annotations.append(
-                        plt.annotate(
-                            round(pres[i, j], 3), (yp[j], xp[j]), color="white"
+                if include_pres:
+                    for j, txt in enumerate(n):
+                        if remove_map_v[i][j]:
+                            continue
+                        annotations.append(
+                            plt.annotate(
+                                round(pres[i, j], 3), (yp[j], xp[j]), color="white"
+                            )
                         )
-                    )
                 plt.subplot(1, 2, 2)
                 plt.imshow(recon[0, i, 0, :, :], cmap="gray")
                 # plt.scatter(gt_nodes_timestep[:,1]*image_size, gt_nodes_timestep[:,0]*image_size, color='g')
@@ -198,8 +203,8 @@ def run_test(
 
             attention_to_next = attention[
                 0,
-                (i - 1) * num_entities : i * num_entities,
-                i * num_entities : (i + 1) * num_entities,
+                max((i - t) * num_entities, 0) : i * num_entities,
+                i * num_entities : (i + t) * num_entities,
             ]
             new_attention = combine_nodes(
                 attention_to_next, combine_map_v, remove_map_v, i - 1

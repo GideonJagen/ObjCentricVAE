@@ -29,15 +29,13 @@ class MultiheadAttention(pl.LightningModule):
         batch_size = latents.shape[0]
         timesteps = latents.shape[1]
 
-        time_mask = self._create_time_mask(latents_frames, max_t=self.max_t)
+        mask = self._create_time_mask(latents_frames, max_t=self.max_t)
 
-        mask = time_mask
-
-        eye = torch.eye(batch_size, dtype=torch.float32, device=time_mask.device)
+        eye = torch.eye(batch_size, dtype=torch.float32, device=mask.device)
         eye = eye.repeat_interleave(timesteps * latents.shape[2], dim=0)
         batch_mask = eye.repeat_interleave(timesteps * latents.shape[2], dim=1)
 
-        time_mask *= batch_mask
+        mask *= batch_mask
 
         # Edges between the supernodes:
         updated_latents, attention_lat = self.multihead_time_attention(
@@ -49,31 +47,53 @@ class MultiheadAttention(pl.LightningModule):
             positions, self.number_of_heads
         )
 
+        attention_lat *= mask
+        attention_lat = attention_lat.nan_to_num(0)
+        attention_pos *= mask
+        attention_pos = attention_pos.nan_to_num(0)
+
+        # Normalize attention_lat and attention_pos
+        attention_lat = torch.sigmoid(
+            (attention_lat - torch.mean(attention_lat)) / torch.std(attention_lat)
+        )
+        attention_pos = torch.sigmoid(
+            (attention_pos - torch.mean(attention_pos)) / torch.std(attention_pos)
+        )
+
         attention = torch.cat(
             [attention_lat, attention_pos * self.pos_attention_weight], dim=0
         )
+
         attention = torch.mean(attention, dim=0, keepdim=True)
+        # attention /= torch.max(attention)
+
+        # normalized_attention = torch.sigmoid(attention)
+
+        # eye = torch.eye(attention.shape[1], device=attention.device, dtype=torch.bool)
+        # attention[torch.unsqueeze(eye, dim=0)] = 0
+
+        # normalized_attention = attention
 
         # attention = torch.squeeze(
         #    self.combine_time_dense(torch.unsqueeze(attention, dim=-1)), dim=-1
         # )
 
-        normalized_attention = torch.nn.functional.softmax(
-            (attention + (1 - mask) * -10e9) / self.softmax_factor, dim=2
-        )
-        normalized_attention = torch.mean(normalized_attention, axis=0, keepdim=True)
+        # normalized_attention = torch.nn.functional.softmax(
+        #    (attention + (1 - mask) * -10e9) / self.softmax_factor, dim=2
+        # )
+        # normalized_attention = torch.mean(normalized_attention, axis=0, keepdim=True)
 
-        add_eye = torch.eye(
-            normalized_attention.shape[1], device=normalized_attention.device
-        )
-        updated_latents = (
-            torch.matmul(normalized_attention + add_eye, updated_latents) / 2
-        )
+        # add_eye = torch.eye(
+        #    normalized_attention.shape[1], device=normalized_attention.device
+        # )
+        # updated_latents = (
+        #    torch.matmul(normalized_attention + add_eye, updated_latents) / 2
+        # )
 
         f = 0.0
-        updated_latents_pos = torch.matmul(
-            normalized_attention * f + add_eye, updated_latents_pos
-        ) / (1 + f)
+        # updated_latents_pos = torch.matmul(
+        #    normalized_attention * f + add_eye, updated_latents_pos
+        # ) / (1 + f)
 
         updated_latents = updated_latents.view(-1, self.number_of_filters)
         # updated_latents_pos = updated_latents_pos.view(-1, self.number_of_filters)
@@ -86,7 +106,7 @@ class MultiheadAttention(pl.LightningModule):
             batch_size * timesteps, -1, updated_latents_pos.shape[-1]
         )
 
-        return [updated_latents, updated_latents_pos, normalized_attention]
+        return [updated_latents, updated_latents_pos, attention]
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=1e-5)
