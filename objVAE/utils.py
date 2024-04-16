@@ -104,7 +104,7 @@ def run_test(
             logvar,
             attention,
             xy,
-        ) = model(x)
+        ) = model(x, training=False)
 
         x = x.detach().cpu().numpy()
         recon = recon.detach().cpu().numpy()
@@ -235,6 +235,146 @@ def run_test(
                         continue
                     x_line = [xp_v[i - 1][previous], xp_v[i][current]]
                     y_line = [yp_v[i - 1][previous], yp_v[i][current]]
+
+                    line = plt.plot(y_line, x_line, c="b")
+                    lines.append(line)
+                lines_v.append(lines)
+
+                plt.savefig(f"../results/gif/fig_{i}.png")
+
+
+def run_test_no_combine(
+    testset,
+    model,
+    t=2,
+    plot_num=0,
+    num_entities=10,
+    pres_floor=0.25,
+    tra_floor=0.25,
+    tail_length=2,
+    include_pres=True,
+    marker_type="o",
+    facecolor="none",
+):
+    lines_v = []
+    for i_seq, x in enumerate(testset):
+
+        x = torch.unsqueeze(x, dim=0)
+        x = x.to(model.device)
+        (
+            recon,
+            indices,
+            pres,
+            kl_divergence,
+            pres_loss,
+            xy_pred,
+            mu,
+            logvar,
+            attention,
+            xy,
+        ) = model(x)
+
+        x = x.detach().cpu().numpy()
+        recon = recon.detach().cpu().numpy()
+        pres = pres.detach().cpu().numpy()
+        xy = xy.detach().cpu().numpy()
+        attention = attention.detach().cpu().numpy()
+
+        n = [i for i in range(num_entities)]
+
+        pres_mask = pres <= pres_floor
+        pres_mask_flat = pres_mask.flatten()
+        attention[0, pres_mask_flat, :] = 0
+        attention[0, :, pres_mask_flat] = 0
+
+        if i_seq == plot_num:
+            plt.figure(figsize=(20, 10))
+
+        for i in range(xy.shape[0]):
+            xp = xy[i, :, 0]
+            yp = xy[i, :, 1]
+
+            if i_seq == plot_num:
+                if i > 0:
+                    scatter.remove()
+                    show.remove()
+                    for ann in annotations:
+                        ann.remove()
+                plt.subplot(1, 2, 1)
+
+                show = plt.imshow(x[0, i, 0, :, :], cmap="gray")
+                # plt.colorbar()
+                scatter = plt.scatter(
+                    yp[~pres_mask[i].astype(bool)],
+                    xp[~pres_mask[i].astype(bool)],
+                    marker=marker_type,
+                    s=300,
+                    edgecolor="r",
+                    facecolor=facecolor,
+                )
+
+                annotations = []
+                if include_pres:
+                    for j, txt in enumerate(n):
+                        if pres_mask[i][j]:
+                            continue
+                        annotations.append(
+                            plt.annotate(
+                                round(pres[i, j], 3), (yp[j], xp[j]), color="white"
+                            )
+                        )
+                plt.subplot(1, 2, 2)
+                plt.imshow(recon[0, i, 0, :, :], cmap="gray")
+                # plt.scatter(gt_nodes_timestep[:,1]*image_size, gt_nodes_timestep[:,0]*image_size, color='g')
+
+            # Calculate attention metrics
+            if i == 0:
+                if i_seq == plot_num:
+                    plt.savefig(f"../results/gif/fig_{i}.png")
+                continue
+
+            attentions = []
+            for j in range(t):
+                attentions.append(
+                    attention[
+                        0,
+                        max((i - 1) * num_entities, 0) : i * num_entities,
+                        (i + j) * num_entities : (i + j + 1) * num_entities,
+                    ]
+                )
+
+            attentions = np.array(attentions)
+
+            max_indices = np.argmax(attentions, axis=-1)
+            binary_attention = np.zeros_like(attentions)
+            binary_attention[:, np.arange(attentions.shape[1]), max_indices] = 1
+            binary_attention *= np.where(attentions > 0, 1, 0)
+
+            binary_attention *= np.where(attentions >= tra_floor, 1, 0)
+
+            remove = np.empty(1, dtype=int)
+            for j in range(1, t):
+                remove = np.append(remove, np.where(binary_attention[j - 1] == 1)[0])
+                binary_attention[j, remove, :] = 0
+
+            if i_seq == plot_num:
+                if len(lines_v) > tail_length:
+                    lines = lines_v.pop(0)
+                    for line in lines:
+                        line.pop(0).remove()
+
+                plt.subplot(1, 2, 1)
+                cols = np.where(binary_attention == 1)
+                lines = []
+                for i_col, _ in enumerate(cols[0]):
+                    if cols[0][i_col] == 1:
+                        break
+                    previous = cols[1][i_col]
+                    current = cols[2][i_col]
+                    if pres_mask[i - 1][previous] or pres_mask[i][current]:
+                        continue
+                    x_line = [xy[i - 1][previous][0], xy[i][current][0]]
+                    y_line = [xy[i - 1][previous][1], xy[i][current][1]]
 
                     line = plt.plot(y_line, x_line, c="b")
                     lines.append(line)

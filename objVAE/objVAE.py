@@ -131,7 +131,7 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
             nn.Linear(decoder_feature_size, 1),
         )
 
-    def forward(self, x):
+    def forward(self, x, training=False):
         true_batch_size = x.shape[0]
         timesteps = x.shape[1]
         batch_size = true_batch_size * timesteps
@@ -163,7 +163,10 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         std = torch.exp(0.5 * logvar)
 
         # Reparametrization
-        parametrization = torch.randn_like(std) * std + mu
+        if training:
+            parametrization = torch.randn_like(std) * std + mu
+        else:
+            parametrization = mu
 
         delta_xy_pred = parametrization[:, :2].view(batch_size, 2, -1)
         parametrization = parametrization[:, 2:].view(
@@ -318,13 +321,25 @@ class MultiEntityVariationalAutoEncoder(pl.LightningModule):
         # Multiply each objects feature map with presence
         decoded_feature_map = pixel_map * weight_map
 
-        # reduce entity dimension by taking max
+        # reduce entity dimension by combining feature maps by layer with ordering based on pres value
         if self.combine_method == "max":
             y = torch.max(decoded_feature_map, dim=1)[0]
         elif self.combine_method == "min":
             y = torch.min(decoded_feature_map, dim=1)[0]
         elif self.combine_method == "sum":
             y = torch.sum(decoded_feature_map, dim=1)
+        elif self.combine_method == "ordered":
+            # sort feature maps by pres value in descending order
+            sorted_indices = torch.argsort(pres, dim=1, descending=True)
+            sorted_feature_maps = torch.gather(
+                decoded_feature_map,
+                1,
+                sorted_indices.unsqueeze(-1).repeat(
+                    1, 1, decoded_feature_map.shape[-2], decoded_feature_map.shape[-1]
+                ),
+            )
+            # combine feature maps by layer
+            y = torch.cat(sorted_feature_maps, dim=1)
         else:
             raise NotImplementedError
 
@@ -659,8 +674,8 @@ class MEVAE(pl.LightningModule):
             glimpse_size=glimpse_size,
         )
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, training=False):
+        return self.model(x, training=training)
 
     def training_step(self, x, batch_idx):
         (
@@ -674,7 +689,7 @@ class MEVAE(pl.LightningModule):
             logvar,
             attention,
             xy,
-        ) = self(x)
+        ) = self(x, training=True)
         # kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
         presence_loss = [pl[idx] for pl, idx in zip(presence_loss, indices)]
 
@@ -698,7 +713,7 @@ class MEVAE(pl.LightningModule):
             logvar,
             attention,
             xy,
-        ) = self(x)
+        ) = self(x, training=False)
         # kl_divergence = [kld[idx] for kld, idx in zip(kl_divergence, indices)]
         presence_loss = [pl[idx] for pl, idx in zip(presence_loss, indices)]
         presence_loss = torch.stack(presence_loss)
